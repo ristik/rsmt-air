@@ -1,0 +1,26 @@
+[package]
+name = "rsmt-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rsmt-bench"
+path = "src/main.rs"
+
+[dependencies]
+rsmt-core.workspace = true
+rsmt-hash.workspace = true
+rsmt-witness.workspace = true
+rsmt-air.workspace = true
+rsmt-prover.workspace = true
+clap.workspace = true
+rand.workspace = true
+rand_xoshiro.workspace = true
+tracing.workspace = true
+tracing-forest.workspace = true
+tracing-subscriber.workspace = true
+num-bigint.workspace = true

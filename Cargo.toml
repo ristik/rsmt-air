@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsmt-core",
+    "crates/rsmt-hash",
+    "crates/rsmt-witness",
+    "crates/rsmt-air",
+    "crates/rsmt-prover",
+    "crates/rsmt-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints]
+rust.rust_2018_idioms = { level = "deny", priority = -1 }
+rust.unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+# Plonky3 git deps (Plonky3/Plonky3 @ main, pinned)
+p3-air = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-blake3 = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-batch-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09", features = ["parallel"] }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09", features = ["parallel"] }
+p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-lookup = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09", features = ["parallel"] }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-poseidon2 = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-poseidon2-air = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09", features = ["parallel"] }
+p3-sha256 = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09", features = ["parallel"] }
+p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4e57164c10183acfeff6dd09" }
+
+# Internal crates
+rsmt-core = { path = "crates/rsmt-core" }
+rsmt-hash = { path = "crates/rsmt-hash" }
+rsmt-witness = { path = "crates/rsmt-witness" }
+rsmt-air = { path = "crates/rsmt-air" }
+rsmt-prover = { path = "crates/rsmt-prover" }
+
+# Third-party
+itertools = "0.14"
+rand = "0.10"
+rand_xoshiro = "0.8"
+sha2 = "0.10"
+num-bigint = { version = "0.4", default-features = false }
+tracing = "0.1"
+tracing-forest = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1.0", default-features = false }
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.profiling]
+inherits = "release"
+debug = true

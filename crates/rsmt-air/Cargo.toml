@@ -1,0 +1,27 @@
+[package]
+name = "rsmt-air"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsmt-core.workspace = true
+rsmt-hash.workspace = true
+rsmt-witness.workspace = true
+p3-air.workspace = true
+p3-baby-bear.workspace = true
+p3-field.workspace = true
+p3-lookup.workspace = true
+p3-matrix.workspace = true
+p3-poseidon2.workspace = true
+p3-poseidon2-air.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+rsmt-core.workspace = true
+num-bigint.workspace = true
+rand.workspace = true
+rand_xoshiro.workspace = true

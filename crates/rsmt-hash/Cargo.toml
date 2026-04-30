@@ -1,0 +1,17 @@
+[package]
+name = "rsmt-hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsmt-core.workspace = true
+p3-baby-bear.workspace = true
+p3-field.workspace = true
+p3-poseidon2.workspace = true
+p3-poseidon2-air.workspace = true
+p3-symmetric.workspace = true
+num-bigint.workspace = true

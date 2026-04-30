@@ -1,0 +1,42 @@
+[package]
+name = "rsmt-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsmt-core.workspace = true
+rsmt-hash.workspace = true
+rsmt-witness.workspace = true
+rsmt-air.workspace = true
+p3-air.workspace = true
+p3-baby-bear.workspace = true
+p3-blake3.workspace = true
+p3-batch-stark.workspace = true
+p3-challenger.workspace = true
+p3-commit.workspace = true
+p3-dft.workspace = true
+p3-field.workspace = true
+p3-fri.workspace = true
+p3-lookup.workspace = true
+p3-matrix.workspace = true
+p3-merkle-tree.workspace = true
+p3-poseidon2.workspace = true
+p3-symmetric.workspace = true
+p3-uni-stark.workspace = true
+p3-poseidon2-air.workspace = true
+p3-sha256.workspace = true
+rand.workspace = true
+num-bigint.workspace = true
+rand_xoshiro.workspace = true
+bincode.workspace = true
+serde.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tracing-subscriber.workspace = true
+tracing-forest.workspace = true

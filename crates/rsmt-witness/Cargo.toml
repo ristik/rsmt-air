@@ -1,0 +1,23 @@
+[package]
+name = "rsmt-witness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsmt-core.workspace = true
+rsmt-hash.workspace = true
+p3-baby-bear.workspace = true
+p3-field.workspace = true
+p3-matrix.workspace = true
+p3-symmetric.workspace = true
+itertools.workspace = true
+num-bigint.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+rand_xoshiro.workspace = true

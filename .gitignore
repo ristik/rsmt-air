@@ -1,0 +1,28 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Python & nodejs
+__pycache__/
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Configuration
+config.toml
+keys/
+
+# Logs
+*.log
+
