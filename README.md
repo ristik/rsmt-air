@@ -221,6 +221,36 @@ with derived hashes
 `hN1 = node_hash(h_b, leaf_hash(k_c, v_c), d₁)` and
 `new_root = node_hash(h_a, hN1, d₂)`.
 
+The trees look like this:
+```mermaid
+flowchart TB
+    classDef unchg fill:#eef,stroke:#447
+    classDef new fill:#cfc,stroke:#393
+    classDef chg fill:#ffe,stroke:#a90
+
+    subgraph OLD["pre-state"]
+      direction TB
+      O2["N(d₂) = old_root"]:::unchg
+      OA["L_a · h_a"]:::unchg
+      OB["L_b · h_b"]:::unchg
+      O2 --> OA
+      O2 --> OB
+    end
+
+    subgraph NEW["post-state"]
+      direction TB
+      N2["N(d₂) = new_root"]:::chg
+      NA["L_a · h_a"]:::unchg
+      N1["N(d₁)  [new]"]:::new
+      NB["L_b · h_b"]:::unchg
+      NC["L_c  [new]"]:::new
+      N2 --> NA
+      N2 --> N1
+      N1 --> NB
+      N1 --> NC
+    end
+```
+
 For reference, the verification using a stack machine would compute like this:
 
 ```
