@@ -619,6 +619,9 @@ and FRI parameters, reporting per-table cell counts and timings.
 ```bash
 cargo build --workspace --release
 ./target/release/rsmt-bench perf [FLAGS]
+
+# Example: pre-insert 100,000 random leaves, then prove fresh batches of 256 and 1024 leaves.
+./target/release/rsmt-bench perf --prefill 100000 --batches 256,1024
 ```
 
 ### `perf` subcommand flags
@@ -626,6 +629,7 @@ cargo build --workspace --release
 | Flag | Default | Meaning |
 |---|---|---|
 | `--batches` | `16,64,256` | Comma-separated list of batch sizes to sweep. |
+| `--prefill` | `0` | Pre-insert this many random leaves into the tree before generating each measured batch proof. |
 | `--seed` | `0` | RNG seed for batch + Fiat–Shamir (deterministic). |
 | `--log-blowup` | `1` | FRI Low Degree Extension rate, `log_2(blowup)`. Larger results with bigger LDE on the prover, but each query is worth more soundness bits. |
 | `--num-queries` | `100` | Number of FRI query rounds. Linear in proof size and verifier work. |
@@ -635,7 +639,8 @@ cargo build --workspace --release
 
 The header line prints the resulting **conjectured soundness bits** according to
 the ethSTARK heuristic: `log_blowup × num_queries + query_pow_bits`. The
-defaults give ~116 bits.
+defaults give ~116 bits. It also prints `prefill=N` so runs against an empty
+tree and runs against an existing tree are easy to distinguish.
 
 Output columns:
 

@@ -47,6 +47,7 @@ impl TableMetric {
 
 #[derive(Debug, Clone)]
 pub struct BatchMetrics {
+    pub prefill_size: usize,
     pub batch_size: usize,
     pub tables: Vec<TableMetric>,
     pub b_real_perms: usize,
@@ -71,6 +72,12 @@ fn rand_key(rng: &mut Xoshiro256PlusPlus) -> BigUint {
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
     BigUint::from_bytes_be(&bytes)
+}
+
+fn rand_value(rng: &mut Xoshiro256PlusPlus) -> Vec<u8> {
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    bytes.to_vec()
 }
 
 /// Holds per-table mutable trace handles for tamper-test injection.
@@ -107,7 +114,23 @@ where
     p3_batch_stark::Domain<H::Config>: PolynomialSpace<Val = F>,
     SymbolicExpressionExt<F, EF>: Algebra<EF>,
 {
-    let (res, m) = prove_and_verify_collect::<H>(seed, batch_size, cfg, |_| {});
+    let (res, m) = prove_and_verify_collect::<H>(seed, 0, batch_size, cfg, |_| {});
+    res.expect("verify_batch");
+    m
+}
+
+pub fn prove_and_verify_with_metrics_cfg_for_prefill<H: ProvingHashSuite>(
+    seed: u64,
+    prefill_size: usize,
+    batch_size: usize,
+    cfg: &ProverConfig,
+) -> BatchMetrics
+where
+    BatchProof<H::Config>: serde::Serialize,
+    p3_batch_stark::Domain<H::Config>: PolynomialSpace<Val = F>,
+    SymbolicExpressionExt<F, EF>: Algebra<EF>,
+{
+    let (res, m) = prove_and_verify_collect::<H>(seed, prefill_size, batch_size, cfg, |_| {});
     res.expect("verify_batch");
     m
 }
@@ -118,16 +141,37 @@ pub fn prove_and_verify_with_metrics_cfg_hash(
     cfg: &ProverConfig,
     hash: ProvingHash,
 ) -> BatchMetrics {
+    prove_and_verify_with_metrics_cfg_hash_prefill(seed, 0, batch_size, cfg, hash)
+}
+
+pub fn prove_and_verify_with_metrics_cfg_hash_prefill(
+    seed: u64,
+    prefill_size: usize,
+    batch_size: usize,
+    cfg: &ProverConfig,
+    hash: ProvingHash,
+) -> BatchMetrics {
     match hash {
         ProvingHash::Poseidon2 => {
-            prove_and_verify_with_metrics_cfg_for::<Poseidon2ProofHash>(seed, batch_size, cfg)
+            prove_and_verify_with_metrics_cfg_for_prefill::<Poseidon2ProofHash>(
+                seed,
+                prefill_size,
+                batch_size,
+                cfg,
+            )
         }
-        ProvingHash::Sha256 => {
-            prove_and_verify_with_metrics_cfg_for::<Sha256ProofHash>(seed, batch_size, cfg)
-        }
-        ProvingHash::Blake3 => {
-            prove_and_verify_with_metrics_cfg_for::<Blake3ProofHash>(seed, batch_size, cfg)
-        }
+        ProvingHash::Sha256 => prove_and_verify_with_metrics_cfg_for_prefill::<Sha256ProofHash>(
+            seed,
+            prefill_size,
+            batch_size,
+            cfg,
+        ),
+        ProvingHash::Blake3 => prove_and_verify_with_metrics_cfg_for_prefill::<Blake3ProofHash>(
+            seed,
+            prefill_size,
+            batch_size,
+            cfg,
+        ),
     }
 }
 
@@ -164,6 +208,7 @@ pub fn prove_and_verify_inner(
 ) -> Result<(), ()> {
     prove_and_verify_collect::<Poseidon2ProofHash>(
         seed,
+        0,
         batch_size,
         &ProverConfig::default(),
         tamper,
@@ -173,6 +218,7 @@ pub fn prove_and_verify_inner(
 
 fn prove_and_verify_collect<H: ProvingHashSuite>(
     seed: u64,
+    prefill_size: usize,
     batch_size: usize,
     cfg: &ProverConfig,
     tamper: impl FnOnce(&mut Traces<'_>),
@@ -184,6 +230,14 @@ where
 {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
+
+    if prefill_size > 0 {
+        let prefill: Vec<_> = (0..prefill_size)
+            .map(|_| (rand_key(&mut rng), rand_value(&mut rng)))
+            .collect();
+        tree.batch_insert(prefill);
+    }
+
     let batch: Vec<_> = (0..batch_size)
         .map(|_| (rand_key(&mut rng), vec![0xCDu8; 32]))
         .collect();
@@ -401,6 +455,7 @@ where
     ];
 
     let mut metrics = BatchMetrics {
+        prefill_size,
         batch_size,
         tables,
         b_real_perms: b_real,

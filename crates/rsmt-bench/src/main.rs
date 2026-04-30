@@ -18,7 +18,9 @@ use tracing_subscriber::{EnvFilter, Registry};
 
 use rsmt_core::{Tree, verify_consistency};
 use rsmt_hash::Poseidon2Hasher;
-use rsmt_prover::batch_demo::prove_and_verify_with_metrics_cfg_hash;
+use rsmt_prover::batch_demo::{
+    prove_and_verify_with_metrics_cfg_hash, prove_and_verify_with_metrics_cfg_hash_prefill,
+};
 use rsmt_prover::config::ProverConfig;
 use rsmt_prover::poseidon2_demo::{P2_VECTOR_LEN, prove_and_verify_poseidon2};
 use rsmt_prover::proof_hash::ProvingHash;
@@ -77,6 +79,9 @@ enum Cmd {
         /// Comma-separated batch sizes (e.g. 16,64,256,1024).
         #[arg(long, default_value = "16,64,256")]
         batches: String,
+        /// Pre-insert this many random leaves before proving each measured batch.
+        #[arg(long, default_value_t = 0)]
+        prefill: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// FRI log_blowup (LDE rate). Larger → bigger LDE, fewer queries
@@ -123,7 +128,7 @@ enum PerfHashArg {
     All,
 }
 
-fn run_perf(batches: &str, seed: u64, cfg: &ProverConfig, hash_arg: PerfHashArg) {
+fn run_perf(batches: &str, prefill: usize, seed: u64, cfg: &ProverConfig, hash_arg: PerfHashArg) {
     let sizes: Vec<usize> = batches
         .split(',')
         .map(|s| s.trim().parse().expect("batch size"))
@@ -141,6 +146,7 @@ fn run_perf(batches: &str, seed: u64, cfg: &ProverConfig, hash_arg: PerfHashArg)
 
     for &hash in hashes {
         println!("proof_hash={}", hash.name());
+        println!("prefill={prefill}");
         println!(
             "FRI: log_blowup={} num_queries={} query_pow_bits={} max_log_arity={} (~{} conjectured soundness bits)",
             cfg.log_blowup,
@@ -163,7 +169,7 @@ fn run_perf(batches: &str, seed: u64, cfg: &ProverConfig, hash_arg: PerfHashArg)
             "proof_KB",
         );
         for &b in &sizes {
-            let m = prove_and_verify_with_metrics_cfg_hash(seed, b, cfg, hash);
+            let m = prove_and_verify_with_metrics_cfg_hash_prefill(seed, prefill, b, cfg, hash);
             println!(
                 "{:>5} {:>8} {:>8} {:>10} {:>12} {:>10} {:>9} {:>9} {:>10} {:>10.1}",
                 m.batch_size,
@@ -308,6 +314,7 @@ fn main() {
         }
         Cmd::Perf {
             batches,
+            prefill,
             seed,
             log_blowup,
             num_queries,
@@ -322,7 +329,7 @@ fn main() {
                 max_log_arity,
                 ..ProverConfig::default()
             };
-            run_perf(&batches, seed, &cfg, hash);
+            run_perf(&batches, prefill, seed, &cfg, hash);
         }
     }
 }
