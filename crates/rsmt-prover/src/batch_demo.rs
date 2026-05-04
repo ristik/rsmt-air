@@ -426,7 +426,7 @@ where
         },
         TableMetric {
             name: "B",
-            real_rows: b_real,
+            real_rows: b_real.div_ceil(table_b_mod::P2_VECTOR_LEN),
             padded_height: b_height,
             main_width: b_trace.width,
             prep_width: rsmt_air::P2_VECTOR_LEN,

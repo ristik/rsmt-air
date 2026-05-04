@@ -789,7 +789,9 @@ trace and tries to produce a verifying proof for a false statement
    that the batch is sorted, that its keys are pairwise distinct, or that
    each key is genuinely absent from the pre-state tree. These are
    protocol-level preconditions on the input given to the prover; see
-   §"Limitations" below.
+   "Limitations" below.
+6. **Node hashing** It is assumed that for internal nodes, the input child
+   hashes are valid hash outputs.
 
 ### What the proof binds, end-to-end
 
