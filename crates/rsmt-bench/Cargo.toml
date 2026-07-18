@@ -23,4 +23,3 @@ rand_xoshiro.workspace = true
 tracing.workspace = true
 tracing-forest.workspace = true
 tracing-subscriber.workspace = true
-num-bigint.workspace = true

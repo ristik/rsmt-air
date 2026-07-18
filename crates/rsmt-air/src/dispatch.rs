@@ -1,113 +1,80 @@
-//! Heterogeneous AIR enum-dispatch wrapper for `p3-batch-stark::prove_batch`.
+//! Heterogeneous-AIR enum dispatch for `p3-batch-stark` (DEVPLAN M4).
+//!
+//! `RsmtAir` wraps the seven table AIRs so they can share one batch commitment.
+//! `LookupAir` is currently the empty default on every table (no buses yet): the
+//! batch proves each table's **local** constraints through the real FRI stack.
+//! Bus registrations are added table-by-table on top of this.
 
 use p3_air::{Air, AirBuilder, BaseAir};
 use p3_baby_bear::BabyBear;
 use p3_field::Field;
 use p3_field::PrimeCharacteristicRing;
-use p3_lookup::{Lookup, LookupAir};
+use p3_lookup::LookupAir;
 use p3_matrix::dense::RowMajorMatrix;
 
-use crate::{TableAAir, TableBAir, TableCAir, TableDAir, TableEAir, TableFAir};
+use crate::{TableAAir, TableBAir, TableCAir, TableDAir, TableFAir, TablePAir, TableRAir};
 
+// Bus-free lookup impls (defaults) for tables whose buses aren't wired yet.
+// Wired so far: Bus 7 (pow2) between Table P (send) and Table F (receive) — their
+// real `LookupAir` impls live in their own modules.
+
+/// Table B's `VectorizedPoseidon2Air` dominates the variant size; that is
+/// inherent to the wrapper and the enum is only ever handled behind a reference.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum RsmtAir {
     A(TableAAir),
     B(TableBAir),
-    F(TableFAir),
-    E(TableEAir),
     C(TableCAir),
     D(TableDAir),
+    R(TableRAir),
+    F(TableFAir),
+    P(TablePAir),
+}
+
+macro_rules! dispatch {
+    ($self:ident, $air:ident => $body:expr) => {
+        match $self {
+            Self::A($air) => $body,
+            Self::B($air) => $body,
+            Self::C($air) => $body,
+            Self::D($air) => $body,
+            Self::R($air) => $body,
+            Self::F($air) => $body,
+            Self::P($air) => $body,
+        }
+    };
 }
 
 impl<F: PrimeCharacteristicRing + Send + Sync> BaseAir<F> for RsmtAir {
     fn width(&self) -> usize {
-        match self {
-            Self::A(a) => <TableAAir as BaseAir<F>>::width(a),
-            Self::B(a) => <TableBAir as BaseAir<F>>::width(a),
-            Self::F(a) => <TableFAir as BaseAir<F>>::width(a),
-            Self::E(a) => <TableEAir as BaseAir<F>>::width(a),
-            Self::C(a) => <TableCAir as BaseAir<F>>::width(a),
-            Self::D(a) => <TableDAir as BaseAir<F>>::width(a),
-        }
+        dispatch!(self, a => BaseAir::<F>::width(a))
     }
-
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
-        match self {
-            Self::A(a) => <TableAAir as BaseAir<F>>::preprocessed_trace(a),
-            Self::B(a) => <TableBAir as BaseAir<F>>::preprocessed_trace(a),
-            Self::F(a) => <TableFAir as BaseAir<F>>::preprocessed_trace(a),
-            Self::E(a) => <TableEAir as BaseAir<F>>::preprocessed_trace(a),
-            Self::C(a) => <TableCAir as BaseAir<F>>::preprocessed_trace(a),
-            Self::D(a) => <TableDAir as BaseAir<F>>::preprocessed_trace(a),
-        }
+        dispatch!(self, a => BaseAir::<F>::preprocessed_trace(a))
     }
-
     fn main_next_row_columns(&self) -> Vec<usize> {
-        match self {
-            Self::A(a) => <TableAAir as BaseAir<F>>::main_next_row_columns(a),
-            Self::B(a) => <TableBAir as BaseAir<F>>::main_next_row_columns(a),
-            Self::F(a) => <TableFAir as BaseAir<F>>::main_next_row_columns(a),
-            Self::E(a) => <TableEAir as BaseAir<F>>::main_next_row_columns(a),
-            Self::C(a) => <TableCAir as BaseAir<F>>::main_next_row_columns(a),
-            Self::D(a) => <TableDAir as BaseAir<F>>::main_next_row_columns(a),
-        }
+        dispatch!(self, a => BaseAir::<F>::main_next_row_columns(a))
     }
-
     fn preprocessed_next_row_columns(&self) -> Vec<usize> {
-        match self {
-            Self::A(a) => <TableAAir as BaseAir<F>>::preprocessed_next_row_columns(a),
-            Self::B(a) => <TableBAir as BaseAir<F>>::preprocessed_next_row_columns(a),
-            Self::F(a) => <TableFAir as BaseAir<F>>::preprocessed_next_row_columns(a),
-            Self::E(a) => <TableEAir as BaseAir<F>>::preprocessed_next_row_columns(a),
-            Self::C(a) => <TableCAir as BaseAir<F>>::preprocessed_next_row_columns(a),
-            Self::D(a) => <TableDAir as BaseAir<F>>::preprocessed_next_row_columns(a),
-        }
+        dispatch!(self, a => BaseAir::<F>::preprocessed_next_row_columns(a))
     }
-
     fn num_public_values(&self) -> usize {
-        match self {
-            Self::A(a) => <TableAAir as BaseAir<F>>::num_public_values(a),
-            Self::B(a) => <TableBAir as BaseAir<F>>::num_public_values(a),
-            Self::F(a) => <TableFAir as BaseAir<F>>::num_public_values(a),
-            Self::E(a) => <TableEAir as BaseAir<F>>::num_public_values(a),
-            Self::C(a) => <TableCAir as BaseAir<F>>::num_public_values(a),
-            Self::D(a) => <TableDAir as BaseAir<F>>::num_public_values(a),
-        }
+        dispatch!(self, a => BaseAir::<F>::num_public_values(a))
     }
 }
 
 impl<AB: AirBuilder<F = BabyBear>> Air<AB> for RsmtAir {
     fn eval(&self, builder: &mut AB) {
-        match self {
-            Self::A(a) => <TableAAir as Air<AB>>::eval(a, builder),
-            Self::B(a) => <TableBAir as Air<AB>>::eval(a, builder),
-            Self::F(a) => <TableFAir as Air<AB>>::eval(a, builder),
-            Self::E(a) => <TableEAir as Air<AB>>::eval(a, builder),
-            Self::C(a) => <TableCAir as Air<AB>>::eval(a, builder),
-            Self::D(a) => <TableDAir as Air<AB>>::eval(a, builder),
-        }
+        dispatch!(self, a => Air::<AB>::eval(a, builder))
     }
 }
 
 impl<F: Field> LookupAir<F> for RsmtAir {
     fn add_lookup_columns(&mut self) -> Vec<usize> {
-        match self {
-            Self::A(a) => <TableAAir as LookupAir<F>>::add_lookup_columns(a),
-            Self::B(a) => <TableBAir as LookupAir<F>>::add_lookup_columns(a),
-            Self::F(a) => <TableFAir as LookupAir<F>>::add_lookup_columns(a),
-            Self::E(a) => <TableEAir as LookupAir<F>>::add_lookup_columns(a),
-            Self::C(a) => <TableCAir as LookupAir<F>>::add_lookup_columns(a),
-            Self::D(a) => <TableDAir as LookupAir<F>>::add_lookup_columns(a),
-        }
+        dispatch!(self, a => LookupAir::<F>::add_lookup_columns(a))
     }
-    fn get_lookups(&mut self) -> Vec<Lookup<F>> {
-        match self {
-            Self::A(a) => <TableAAir as LookupAir<F>>::get_lookups(a),
-            Self::B(a) => <TableBAir as LookupAir<F>>::get_lookups(a),
-            Self::F(a) => <TableFAir as LookupAir<F>>::get_lookups(a),
-            Self::E(a) => <TableEAir as LookupAir<F>>::get_lookups(a),
-            Self::C(a) => <TableCAir as LookupAir<F>>::get_lookups(a),
-            Self::D(a) => <TableDAir as LookupAir<F>>::get_lookups(a),
-        }
+    fn get_lookups(&mut self) -> Vec<p3_lookup::Lookup<F>> {
+        dispatch!(self, a => LookupAir::<F>::get_lookups(a))
     }
 }

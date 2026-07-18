@@ -133,8 +133,9 @@ impl ProvingHashSuite for Blake3ProofHash {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum ProvingHash {
+    #[default]
     Poseidon2,
     Sha256,
     Blake3,
@@ -147,11 +148,5 @@ impl ProvingHash {
             Self::Sha256 => Sha256ProofHash::NAME,
             Self::Blake3 => Blake3ProofHash::NAME,
         }
-    }
-}
-
-impl Default for ProvingHash {
-    fn default() -> Self {
-        Self::Poseidon2
     }
 }

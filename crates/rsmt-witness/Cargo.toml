@@ -21,3 +21,4 @@ rayon.workspace = true
 [dev-dependencies]
 rand.workspace = true
 rand_xoshiro.workspace = true
+proptest.workspace = true

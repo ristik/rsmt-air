@@ -1,12 +1,22 @@
-//! Prover wiring around `p3-uni-stark` and `p3-fri` for RSMT3 AIRs.
+//! Prover wiring around `p3-batch-stark` for the RSMT v6a AIRs (DEVPLAN M4).
 //!
-//! Exposes standalone demos for individual tables plus the six-AIR
-//! `prove_batch` wiring with LogUp buses.
+//! `prove_and_verify_round` proves all seven table AIRs for one round through
+//! the real FRI stack and verifies the result. The FRI/transcript proof hash is
+//! selectable (`proof_hash`), independent of the in-circuit Poseidon2.
 
-pub mod batch_demo;
 pub mod config;
-pub mod poseidon2_demo;
 pub mod proof_hash;
-pub mod table_a_demo;
-pub mod table_f_demo;
-pub mod tamper;
+pub mod round;
+#[cfg(test)]
+mod tamper;
+
+pub use config::ProverConfig;
+pub use proof_hash::{
+    Blake3ProofHash, Poseidon2ProofHash, ProvingHash, ProvingHashSuite, Sha256ProofHash,
+};
+pub use round::{
+    RoundMetrics, RoundShape, TableMetric, prove_and_verify_round, prove_and_verify_round_metrics,
+};
+
+#[cfg(test)]
+mod tests;

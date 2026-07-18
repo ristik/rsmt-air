@@ -1,68 +1,74 @@
-//! Table A AIR — verification-row local constraints (no buses yet).
+//! Table A — proof rows (DEVPLAN M3). One row per opcode, five one-hot
+//! selectors `(is_s, is_o, is_ol, is_l, is_n)`, the digest pair, the advice
+//! tuple, and the opcode-specific link columns.
 //!
-//! Layout (24 witness columns):
-//!   0: is_s   1: is_l   2: is_n
-//!   3: depth  4: batch_idx
-//!   5..13:  old_hash[0..8]
-//!  13..21:  new_hash[0..8]
-//!  21: old_is_none  22: left_ptr  23: node_hash_old_needed
-//!
-//! Preprocessed (3 columns):
-//!   0: row_idx  1: is_real  2: is_last_real
-//!
-//! Public values (16):
-//!   [old_root[0..8], new_root[0..8]]
+//! Local constraints only (buses arrive in M4). Max constraint degree **2**.
+//! Selector-gated rules rely on padding rows being syntactically zero (enforced
+//! here), so they need no extra `is_real` factor.
 
-use p3_air::symbolic::SymbolicAirBuilder;
-use p3_air::{Air, AirBuilder, AirLayout, BaseAir, BaseLeaf, SymbolicExpression, WindowAccess};
+use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_baby_bear::BabyBear;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_lookup::{Direction, Kind, Lookup, LookupAir, LookupInput};
+use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 
+use rsmt_core::KEY_BITS;
+use rsmt_core::LIMBS;
 use rsmt_hash::DIGEST_WIDTH;
-use rsmt_witness::TableARow;
+use rsmt_witness::{ARow, OpKind, Publics};
 
-pub const TABLE_A_WIDTH: usize = 24;
-pub const TABLE_A_PREP_WIDTH: usize = 3;
-pub const NUM_PUBLIC: usize = 2 * DIGEST_WIDTH;
+use crate::cols::{cast, width_of};
 
-const C_IS_S: usize = 0;
-const C_IS_L: usize = 1;
-const C_IS_N: usize = 2;
-const C_DEPTH: usize = 3;
-const C_BATCH_IDX: usize = 4;
-const C_OLD_HASH: usize = 5;
-const C_NEW_HASH: usize = 13;
-const C_OLD_IS_NONE: usize = 21;
-const C_LEFT_PTR: usize = 22;
-const C_NHON: usize = 23;
+/// Main columns (37).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ACols<T> {
+    // one-hot opcode selectors
+    pub is_s: T,
+    pub is_o: T,
+    pub is_ol: T,
+    pub is_l: T,
+    pub is_n: T,
+    // digest pair
+    pub old: [T; DIGEST_WIDTH],
+    pub new: [T; DIGEST_WIDTH],
+    pub old_is_none: T,
+    // advice tuple
+    pub has_advice: T,
+    pub delta: T,
+    pub rho: [T; LIMBS],
+    // opcode-specific links
+    pub batch_idx: T,
+    pub node_hash_old_needed: T,
+    pub opened_idx: T,
+    /// Post-order subtree start (D19). Base opcodes constrain it to `row_idx`;
+    /// `N` rows receive it from Table F over Bus 3 (= left child's start). Sent
+    /// on Bus 1 so a parent join can read a child's start.
+    pub subtree_start: T,
+}
 
-const P_ROW_IDX: usize = 0;
-const P_IS_REAL: usize = 1;
-const P_IS_LAST_REAL: usize = 2;
+/// Preprocessed columns (3).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct APrepCols<T> {
+    pub row_idx: T,
+    pub is_real: T,
+    pub is_last_real: T,
+}
+
+pub const TABLE_A_WIDTH: usize = width_of::<ACols<u8>>();
+pub const TABLE_A_PREP_WIDTH: usize = width_of::<APrepCols<u8>>();
+/// `old_root[8]`, `new_root[8]`, and `old_root_is_none` (D20): the statement
+/// distinguishes genesis `None` from `Some([0;8])`.
+pub const NUM_PUBLIC: usize = 2 * DIGEST_WIDTH + 1;
+
+const _: () = assert!(TABLE_A_WIDTH == 37);
 
 #[derive(Clone)]
 pub struct TableAAir {
-    /// Length of the padded trace (must be a power of two).
     pub padded_height: usize,
-    /// Number of real (non-padding) rows.
     pub real_rows: usize,
-    /// Counter used during `LookupAir::add_lookup_columns`.
     pub num_lookups: usize,
 }
-
-/// Bus 1 tuple width: row_idx, old_hash[8], new_hash[8], old_is_none.
-/// Depth is intentionally excluded: A rows of type S/L carry depth=0
-/// while the parent's depth is recorded in F. Depth is range-checked
-/// independently via Bus 5.
-pub const BUS_TREE_TUPLE_WIDTH: usize = 1 + DIGEST_WIDTH + DIGEST_WIDTH + 1;
-pub const BUS_TREE_NAME: &str = "tree";
-
-/// Bus 3 tuple width: row_idx, old_hash[8], new_hash[8], old_is_none, depth,
-/// node_hash_old_needed. The back-link from Table F to Table A's N rows.
-pub const BUS_PARENT_TUPLE_WIDTH: usize = 1 + DIGEST_WIDTH + DIGEST_WIDTH + 1 + 1 + 1;
-pub const BUS_PARENT_NAME: &str = "parent";
 
 impl TableAAir {
     pub const fn new(padded_height: usize, real_rows: usize) -> Self {
@@ -74,6 +80,105 @@ impl TableAAir {
     }
 }
 
+impl<F: p3_field::Field> p3_lookup::LookupAir<F> for TableAAir {
+    fn add_lookup_columns(&mut self) -> Vec<usize> {
+        let idx = self.num_lookups;
+        self.num_lookups += 1;
+        vec![idx]
+    }
+
+    fn get_lookups(&mut self) -> Vec<p3_lookup::Lookup<F>> {
+        use p3_air::AirLayout;
+        use p3_air::symbolic::{SymbolicAirBuilder, SymbolicExpression};
+        use p3_lookup::{Direction, Kind};
+        type SE<F> = SymbolicExpression<F>;
+        self.num_lookups = 0;
+        let sb = SymbolicAirBuilder::<F>::new(AirLayout {
+            main_width: TABLE_A_WIDTH,
+            preprocessed_width: TABLE_A_PREP_WIDTH,
+            num_public_values: NUM_PUBLIC,
+            ..Default::default()
+        });
+        let main = sb.main();
+        let ml = main.current_slice();
+        let prep = sb.preprocessed();
+        let pl = prep.current_slice();
+        // ACols: is_o(1), is_ol(2), is_l(3), is_n(4), old[5..13], new[13..21],
+        // old_is_none(21), has_advice(22), delta(23), rho[24..33], batch_idx(33),
+        // nhon(34), opened_idx(35), subtree_start(36).
+        let is_o: SE<F> = ml[1].into();
+        let is_ol: SE<F> = ml[2].into();
+        let is_l: SE<F> = ml[3].into();
+        let is_n: SE<F> = ml[4].into();
+        let mut lookups = Vec::new();
+
+        // Bus 4 (leaf): receive (kind=is_ol, idx=batch_idx+opened_idx, new[8], rho[9])
+        // on L/OL rows.
+        let idx: SE<F> = SE::<F>::from(ml[33]) + SE::<F>::from(ml[35]);
+        let mut leaf: Vec<SE<F>> = vec![is_ol.clone(), idx];
+        for j in 0..8 {
+            leaf.push(ml[13 + j].into());
+        }
+        for j in 0..9 {
+            leaf.push(ml[24 + j].into());
+        }
+        lookups.push(p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(crate::table_c::BUS_LEAF_NAME.to_string()),
+            &[(leaf, is_l + is_ol.clone(), Direction::Receive)],
+        ));
+
+        // Bus 3 (parent): receive (row_idx, old[8], new[8], old_is_none, delta,
+        // rho[9], nhon, subtree_start) on N/O rows → matches F's parent send.
+        let mut parent: Vec<SE<F>> = vec![pl[0].into()];
+        for j in 0..8 {
+            parent.push(ml[5 + j].into());
+        }
+        for j in 0..8 {
+            parent.push(ml[13 + j].into());
+        }
+        parent.push(ml[21].into()); // old_is_none
+        parent.push(ml[23].into()); // delta (= depth)
+        for j in 0..9 {
+            parent.push(ml[24 + j].into()); // rho (= region)
+        }
+        parent.push(ml[34].into()); // nhon
+        parent.push(ml[36].into()); // subtree_start (D19)
+        lookups.push(p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(crate::table_f::BUS_PARENT_NAME.to_string()),
+            &[(parent, is_n + is_o, Direction::Receive)],
+        ));
+
+        // Bus 1 (tree): send (row_idx, subtree_start, old[8], new[8], old_is_none,
+        // has_advice, delta, rho[9]) on every non-last real row → consumed by F
+        // as a child. subtree_start (D19) lets the parent join derive child rows.
+        let is_real: SE<F> = pl[1].into();
+        let is_last: SE<F> = pl[2].into();
+        let mut tree: Vec<SE<F>> = vec![pl[0].into(), ml[36].into()];
+        for j in 0..8 {
+            tree.push(ml[5 + j].into());
+        }
+        for j in 0..8 {
+            tree.push(ml[13 + j].into());
+        }
+        tree.push(ml[21].into()); // old_is_none
+        tree.push(ml[22].into()); // has_advice
+        tree.push(ml[23].into()); // delta
+        for j in 0..9 {
+            tree.push(ml[24 + j].into()); // rho
+        }
+        lookups.push(p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(BUS_TREE_NAME.to_string()),
+            &[(tree, is_real - is_last, Direction::Send)],
+        ));
+        lookups
+    }
+}
+
+pub const BUS_TREE_NAME: &str = "tree";
+
 impl<F: PrimeCharacteristicRing + Send + Sync> BaseAir<F> for TableAAir {
     fn width(&self) -> usize {
         TABLE_A_WIDTH
@@ -83,11 +188,9 @@ impl<F: PrimeCharacteristicRing + Send + Sync> BaseAir<F> for TableAAir {
         let h = self.padded_height;
         let mut data = Vec::with_capacity(h * TABLE_A_PREP_WIDTH);
         for i in 0..h {
-            let is_real = i < self.real_rows;
-            let is_last = i + 1 == self.real_rows;
             data.push(F::from_u32(i as u32));
-            data.push(F::from_bool(is_real));
-            data.push(F::from_bool(is_last));
+            data.push(F::from_bool(i < self.real_rows));
+            data.push(F::from_bool(i + 1 == self.real_rows));
         }
         Some(RowMajorMatrix::new(data, TABLE_A_PREP_WIDTH))
     }
@@ -98,7 +201,6 @@ impl<F: PrimeCharacteristicRing + Send + Sync> BaseAir<F> for TableAAir {
     fn preprocessed_next_row_columns(&self) -> Vec<usize> {
         vec![]
     }
-
     fn num_public_values(&self) -> usize {
         NUM_PUBLIC
     }
@@ -110,269 +212,161 @@ where
 {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
-        let local = main.current_slice();
-        let prep = builder.preprocessed().current_slice();
-
-        let is_real = prep[P_IS_REAL];
-        let is_last = prep[P_IS_LAST_REAL];
-        let _row_idx = prep[P_ROW_IDX]; // currently unused locally
-
-        let is_s = local[C_IS_S];
-        let is_l = local[C_IS_L];
-        let is_n = local[C_IS_N];
-        let depth = local[C_DEPTH];
-        let batch_idx = local[C_BATCH_IDX];
-        let old_is_none = local[C_OLD_IS_NONE];
-        let left_ptr = local[C_LEFT_PTR];
-        let nhon = local[C_NHON];
+        let prep = builder.preprocessed();
+        let c: &ACols<AB::Var> = cast(main.current_slice());
+        let p: &APrepCols<AB::Var> = cast(prep.current_slice());
 
         let one = AB::Expr::ONE;
+        let e = |v: AB::Var| -> AB::Expr { v.into() };
 
-        // Booleanity (gated by is_real).
-        for &b in &[is_s, is_l, is_n, old_is_none, nhon] {
-            builder.assert_zero(is_real * b * (b - one.clone()));
+        let is_s = e(c.is_s);
+        let is_o = e(c.is_o);
+        let is_ol = e(c.is_ol);
+        let is_l = e(c.is_l);
+        let is_n = e(c.is_n);
+        let old_is_none = e(c.old_is_none);
+        let has_advice = e(c.has_advice);
+        let nhon = e(c.node_hash_old_needed);
+        let is_real = e(p.is_real);
+        let is_last = e(p.is_last_real);
+        let row_idx = e(p.row_idx);
+
+        // Booleanity of every flag.
+        for b in [
+            &is_s,
+            &is_o,
+            &is_ol,
+            &is_l,
+            &is_n,
+            &old_is_none,
+            &has_advice,
+            &nhon,
+        ] {
+            builder.assert_zero(b.clone() * (b.clone() - one.clone()));
         }
 
-        // One-hot opcode.
-        builder.assert_zero(is_real * (is_s + is_l + is_n - one.clone()));
+        // One-hot: exactly one selector on a real row, none on padding.
+        builder.assert_zero(
+            is_s.clone() + is_o.clone() + is_ol.clone() + is_l.clone() + is_n.clone()
+                - is_real.clone(),
+        );
 
-        // S → not none; L → none.
-        builder.assert_zero(is_real * is_s * old_is_none);
-        builder.assert_zero(is_real * is_l * (one.clone() - old_is_none));
+        // Advice presence: on for O/OL/L/N, off for S.
+        builder.assert_zero(
+            has_advice.clone() - (is_o.clone() + is_ol.clone() + is_l.clone() + is_n.clone()),
+        );
 
-        // S: old == new.
+        // old_is_none per opcode: S/O/OL ⇒ 0; L ⇒ 1; N free.
+        builder.assert_zero((is_s.clone() + is_o.clone() + is_ol.clone()) * old_is_none.clone());
+        builder.assert_zero(is_l.clone() * (one.clone() - old_is_none.clone()));
+
+        // Digest shapes.
+        let sole = is_s.clone() + is_o.clone() + is_ol.clone(); // "old = new" opcodes
         for j in 0..DIGEST_WIDTH {
-            let oh = local[C_OLD_HASH + j];
-            let nh = local[C_NEW_HASH + j];
-            builder.assert_zero(is_real * is_s * (oh - nh));
+            let old_j = e(c.old[j]);
+            let new_j = e(c.new[j]);
+            // S/O/OL ⇒ old = new
+            builder.assert_zero(sole.clone() * (old_j.clone() - new_j));
+            // L ⇒ old = 0
+            builder.assert_zero(is_l.clone() * old_j.clone());
+            // old_is_none ⇒ old = 0 (canonical zeroing)
+            builder.assert_zero(old_is_none.clone() * old_j);
         }
 
-        // L: old_hash[j] = 0.
+        // Advice-tuple shapes.
+        builder.assert_zero(is_s.clone() * e(c.delta)); // S ⇒ delta = 0
+        // L/OL ⇒ delta = κ (256)
+        let kappa = AB::Expr::from_u32(KEY_BITS as u32);
+        builder.assert_zero((is_l.clone() + is_ol.clone()) * (e(c.delta) - kappa));
+        for j in 0..LIMBS {
+            builder.assert_zero(is_s.clone() * e(c.rho[j])); // S ⇒ rho = 0
+        }
+
+        // Link-column canonical zeroing (each free only under its opcode).
+        builder.assert_zero((one.clone() - is_l.clone()) * e(c.batch_idx));
+        builder.assert_zero((one.clone() - is_n.clone()) * nhon.clone());
+        builder.assert_zero((one.clone() - is_o.clone() - is_ol.clone()) * e(c.opened_idx));
+
+        // D19 post-order subtree_start. Base opcodes (S/O/OL/L) start at their own
+        // row; N rows inherit the left child's start over Bus 3 (no local rule).
+        let base = is_s.clone() + is_o.clone() + is_ol.clone() + is_l.clone();
+        builder.assert_zero(base * (e(c.subtree_start) - row_idx));
+        // The root (last real row) spans the whole trace: its start is 0.
+        builder.assert_zero(is_last.clone() * e(c.subtree_start));
+
+        // Boundary: the last real row pins the public roots and old_root_is_none.
+        let pubs: Vec<AB::Expr> = builder.public_values().iter().map(|&v| v.into()).collect();
         for j in 0..DIGEST_WIDTH {
-            let oh = local[C_OLD_HASH + j];
-            builder.assert_zero(is_real * is_l * oh);
+            builder.assert_zero(is_last.clone() * (e(c.old[j]) - pubs[j].clone()));
+            builder.assert_zero(is_last.clone() * (e(c.new[j]) - pubs[DIGEST_WIDTH + j].clone()));
         }
+        // D20: genesis `None` vs `Some([0;8])` is public.
+        builder
+            .assert_zero(is_last.clone() * (old_is_none.clone() - pubs[2 * DIGEST_WIDTH].clone()));
 
-        // S/L canonical zero columns.
-        builder.assert_zero(is_real * is_l * left_ptr);
-        builder.assert_zero(is_real * is_l * depth);
-        builder.assert_zero(is_real * is_l * nhon);
-        builder.assert_zero(is_real * is_s * left_ptr);
-        builder.assert_zero(is_real * is_s * depth);
-        builder.assert_zero(is_real * is_s * batch_idx);
-        builder.assert_zero(is_real * is_s * nhon);
-        builder.assert_zero(is_real * is_n * batch_idx);
-
-        // Canonical zeroing: old_is_none ⇒ old_hash zero.
-        for j in 0..DIGEST_WIDTH {
-            let oh = local[C_OLD_HASH + j];
-            builder.assert_zero(is_real * old_is_none * oh);
-        }
-
-        // Boundary: last real row's hashes must equal the public roots.
-        let pubs: Vec<AB::PublicVar> = builder.public_values().to_vec();
-        for j in 0..DIGEST_WIDTH {
-            let old_root = pubs[j];
-            let new_root = pubs[DIGEST_WIDTH + j];
-            let oh = local[C_OLD_HASH + j];
-            let nh = local[C_NEW_HASH + j];
-            builder.assert_zero(is_last * (oh - old_root.into()));
-            builder.assert_zero(is_last * (nh - new_root.into()));
-        }
-        // Padding rows: every witness column must be zero (so they don't pollute
-        // future LogUp multiplicities). Equivalent to is_real flipping all
-        // selectors off.
+        // Padding hygiene: every main column is zero on padding rows.
         let not_real = one.clone() - is_real;
-        for j in 0..TABLE_A_WIDTH {
-            builder.assert_zero(not_real.clone() * local[j]);
+        let row = main.current_slice();
+        for &cell in row {
+            builder.assert_zero(not_real.clone() * e(cell));
         }
     }
 }
 
-impl<F: Field> LookupAir<F> for TableAAir {
-    fn add_lookup_columns(&mut self) -> Vec<usize> {
-        let idx = self.num_lookups;
-        self.num_lookups += 1;
-        vec![idx]
-    }
+// -- trace generation -------------------------------------------------------
 
-    fn get_lookups(&mut self) -> Vec<Lookup<F>> {
-        self.num_lookups = 0;
-        let layout = AirLayout {
-            main_width: TABLE_A_WIDTH,
-            preprocessed_width: TABLE_A_PREP_WIDTH,
-            num_public_values: NUM_PUBLIC,
-            ..Default::default()
-        };
-        let sb = SymbolicAirBuilder::<F>::new(layout);
-        let main = sb.main();
-        let main_local = main.current_slice();
-        let prep = sb.preprocessed();
-        let prep_local = prep.current_slice();
-
-        let one: SymbolicExpression<F> = SymbolicExpression::Leaf(BaseLeaf::Constant(F::ONE));
-        let is_real: SymbolicExpression<F> = prep_local[P_IS_REAL].into();
-        let is_last: SymbolicExpression<F> = prep_local[P_IS_LAST_REAL].into();
-        let mult = is_real - is_last; // is_real * (1 - is_last_real), since both bool
-
-        let mut tuple: Vec<SymbolicExpression<F>> = Vec::with_capacity(BUS_TREE_TUPLE_WIDTH);
-        tuple.push(prep_local[P_ROW_IDX].into());
-        for j in 0..DIGEST_WIDTH {
-            tuple.push(main_local[C_OLD_HASH + j].into());
-        }
-        for j in 0..DIGEST_WIDTH {
-            tuple.push(main_local[C_NEW_HASH + j].into());
-        }
-        tuple.push(main_local[C_OLD_IS_NONE].into());
-        let _ = one;
-
-        let inputs: Vec<LookupInput<F>> = vec![(tuple, mult, Direction::Send)];
-        let tree_lookup =
-            LookupAir::register_lookup(self, Kind::Global(BUS_TREE_NAME.to_string()), &inputs);
-
-        // Bus 3 (parent): receive on N rows.
-        let is_n: SymbolicExpression<F> = main_local[C_IS_N].into();
-        let is_real_2: SymbolicExpression<F> = prep_local[P_IS_REAL].into();
-        let parent_mult = is_real_2 * is_n;
-        let mut parent_tuple: Vec<SymbolicExpression<F>> =
-            Vec::with_capacity(BUS_PARENT_TUPLE_WIDTH);
-        parent_tuple.push(prep_local[P_ROW_IDX].into());
-        for j in 0..DIGEST_WIDTH {
-            parent_tuple.push(main_local[C_OLD_HASH + j].into());
-        }
-        for j in 0..DIGEST_WIDTH {
-            parent_tuple.push(main_local[C_NEW_HASH + j].into());
-        }
-        parent_tuple.push(main_local[C_OLD_IS_NONE].into());
-        parent_tuple.push(main_local[C_DEPTH].into());
-        parent_tuple.push(main_local[C_NHON].into());
-        let parent_inputs: Vec<LookupInput<F>> =
-            vec![(parent_tuple, parent_mult, Direction::Receive)];
-        let parent_lookup = LookupAir::register_lookup(
-            self,
-            Kind::Global(BUS_PARENT_NAME.to_string()),
-            &parent_inputs,
-        );
-
-        // Bus 5 (u8): receive `(depth)` on N rows.
-        let is_n_5: SymbolicExpression<F> = main_local[C_IS_N].into();
-        let is_real_5: SymbolicExpression<F> = prep_local[P_IS_REAL].into();
-        let u8_mult = is_real_5 * is_n_5;
-        let u8_tuple: Vec<SymbolicExpression<F>> = vec![main_local[C_DEPTH].into()];
-        let u8_inputs: Vec<LookupInput<F>> = vec![(u8_tuple, u8_mult, Direction::Receive)];
-        let u8_lookup = LookupAir::register_lookup(
-            self,
-            Kind::Global(crate::table_e::BUS_U8_NAME.to_string()),
-            &u8_inputs,
-        );
-
-        // Bus 4 (leaf_hash): receive `(batch_idx, new_hash[0..8])` on L rows.
-        let is_l_4: SymbolicExpression<F> = main_local[C_IS_L].into();
-        let is_real_4: SymbolicExpression<F> = prep_local[P_IS_REAL].into();
-        let leaf_mult = is_real_4 * is_l_4;
-        let mut leaf_tuple: Vec<SymbolicExpression<F>> = Vec::with_capacity(1 + DIGEST_WIDTH);
-        leaf_tuple.push(main_local[C_BATCH_IDX].into());
-        for j in 0..DIGEST_WIDTH {
-            leaf_tuple.push(main_local[C_NEW_HASH + j].into());
-        }
-        let leaf_inputs: Vec<LookupInput<F>> = vec![(leaf_tuple, leaf_mult, Direction::Receive)];
-        let leaf_lookup = LookupAir::register_lookup(
-            self,
-            Kind::Global(crate::table_c::BUS_LEAF_HASH_NAME.to_string()),
-            &leaf_inputs,
-        );
-
-        vec![tree_lookup, parent_lookup, u8_lookup, leaf_lookup]
+fn push_digest(data: &mut Vec<BabyBear>, d: &[BabyBear; DIGEST_WIDTH]) {
+    for v in d {
+        data.push(*v);
     }
 }
 
-/// Materialize a Table A trace (BabyBear) from witness rows. Pads to next
-/// pow-2 height (≥ 2). Returns the padded matrix; the caller passes the same
-/// `(real, height)` to the AIR.
-pub fn build_trace_babybear(rows: &[TableARow]) -> (RowMajorMatrix<BabyBear>, usize, usize) {
+fn push_arow(data: &mut Vec<BabyBear>, r: &ARow) {
+    let sel = |k: OpKind| BabyBear::from_bool(r.kind == k);
+    data.push(sel(OpKind::S));
+    data.push(sel(OpKind::O));
+    data.push(sel(OpKind::OL));
+    data.push(sel(OpKind::L));
+    data.push(sel(OpKind::N));
+    push_digest(data, &r.old);
+    push_digest(data, &r.new);
+    data.push(BabyBear::from_bool(r.old_is_none));
+    data.push(BabyBear::from_bool(r.has_advice));
+    data.push(BabyBear::from_u32(r.delta as u32));
+    for l in r.rho {
+        data.push(BabyBear::from_u32(l));
+    }
+    data.push(BabyBear::from_u32(r.batch_idx));
+    data.push(BabyBear::from_bool(r.node_hash_old_needed));
+    data.push(BabyBear::from_u32(r.opened_idx));
+    data.push(BabyBear::from_u32(r.subtree_start));
+}
+
+/// Build Table A's main trace, padded to a power-of-two height (≥ 2).
+pub fn build_trace(rows: &[ARow]) -> (RowMajorMatrix<BabyBear>, usize, usize) {
     let real = rows.len();
     let height = real.next_power_of_two().max(2);
     let mut data = Vec::with_capacity(height * TABLE_A_WIDTH);
     for r in rows {
-        push_row_bb(&mut data, r);
+        push_arow(&mut data, r);
     }
     for _ in real..height {
-        push_padding_bb(&mut data);
+        for _ in 0..TABLE_A_WIDTH {
+            data.push(BabyBear::ZERO);
+        }
     }
     (RowMajorMatrix::new(data, TABLE_A_WIDTH), real, height)
 }
 
-fn push_row_bb(data: &mut Vec<BabyBear>, r: &TableARow) {
-    data.push(BabyBear::from_bool(r.is_s));
-    data.push(BabyBear::from_bool(r.is_l));
-    data.push(BabyBear::from_bool(r.is_n));
-    data.push(BabyBear::from_u32(r.depth as u32));
-    data.push(BabyBear::from_u32(r.batch_idx));
-    for j in 0..DIGEST_WIDTH {
-        data.push(r.old_hash[j]);
-    }
-    for j in 0..DIGEST_WIDTH {
-        data.push(r.new_hash[j]);
-    }
-    data.push(BabyBear::from_bool(r.old_is_none));
-    data.push(BabyBear::from_u32(r.left_ptr as u32));
-    data.push(BabyBear::from_bool(r.node_hash_old_needed));
-}
-
-fn push_padding_bb(data: &mut Vec<BabyBear>) {
-    for _ in 0..TABLE_A_WIDTH {
-        data.push(BabyBear::ZERO);
-    }
+/// The 16 public values `[old_root[8], new_root[8]]` (D6: `None` old root maps
+/// to the canonical all-zero digest, carried in `Publics::old_root`).
+pub fn public_values(pubs: &Publics) -> Vec<BabyBear> {
+    let mut v = Vec::with_capacity(NUM_PUBLIC);
+    v.extend_from_slice(&pubs.old_root);
+    v.extend_from_slice(&pubs.new_root);
+    v.push(BabyBear::from_bool(pubs.old_root_is_none));
+    v
 }
 
 #[cfg(test)]
-mod tests {
-    use num_bigint::BigUint;
-    use p3_air::check_constraints;
-    use rand::{RngExt, SeedableRng};
-    use rand_xoshiro::Xoshiro256PlusPlus;
-
-    use rsmt_core::{Tree, get_sort_key};
-    use rsmt_hash::Poseidon2Hasher;
-    use rsmt_witness::build_table_a;
-
-    use super::*;
-
-    fn rand_key(rng: &mut Xoshiro256PlusPlus) -> BigUint {
-        let mut bytes = [0u8; 32];
-        rng.fill(&mut bytes);
-        BigUint::from_bytes_be(&bytes)
-    }
-
-    #[test]
-    fn table_a_constraints_pass_on_real_proof() {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
-        let mut tree: Tree<Poseidon2Hasher> = Tree::new();
-
-        let batch: Vec<_> = (0..16)
-            .map(|_| (rand_key(&mut rng), vec![0xCDu8; 32]))
-            .collect();
-        let pre_root = tree.root_hash();
-        let (items, proof) = tree.batch_insert(batch);
-        let post_root = tree.root_hash().unwrap();
-        let mut sorted = items;
-        sorted.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
-
-        let rows = build_table_a::<Poseidon2Hasher>(&proof, &sorted);
-        let (trace, real, height) = build_trace_babybear(&rows);
-
-        let air = TableAAir::new(height, real);
-
-        let mut publics = Vec::with_capacity(NUM_PUBLIC);
-        let zero = [BabyBear::ZERO; DIGEST_WIDTH];
-        let or = pre_root.unwrap_or(zero);
-        for v in or {
-            publics.push(v);
-        }
-        for v in post_root {
-            publics.push(v);
-        }
-
-        check_constraints(&air, &trace, &publics);
-    }
-}
+mod tests;

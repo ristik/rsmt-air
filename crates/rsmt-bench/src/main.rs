@@ -1,13 +1,14 @@
-//! `rsmt-bench` — CLI entry point.
+//! `rsmt-bench` — CLI benchmarks for the RSMT v6a arithmetization (DEVPLAN M6).
 //!
-//! Today exposes two subcommands:
-//! - `smt`: build a tree, apply a batch, verify the consistency proof on the CPU.
-//! - `poseidon2`: end-to-end FRI proof of a batch of Poseidon2 permutations.
+//! Subcommands:
+//! - `smt`: CPU-only — prefill a tree, apply a batch, verify the consistency proof (no ZK).
+//! - `round`: one end-to-end batch-STARK round (all 8 tables, 7 buses) with a per-table
+//!   real/padded/width/cells breakdown, timings, and proof size.
+//! - `perf`: sweep batch sizes (and/or proof hashes) through `round`.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use num_bigint::BigUint;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use tracing_forest::ForestLayer;
@@ -16,19 +17,15 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-use rsmt_core::{Tree, verify_consistency};
+use rsmt_core::{Key, KeyValue, Tree, bytes_to_limbs, verify_consistency};
 use rsmt_hash::Poseidon2Hasher;
-use rsmt_prover::batch_demo::{
-    prove_and_verify_with_metrics_cfg_hash, prove_and_verify_with_metrics_cfg_hash_prefill,
-};
 use rsmt_prover::config::ProverConfig;
-use rsmt_prover::poseidon2_demo::{P2_VECTOR_LEN, prove_and_verify_poseidon2};
-use rsmt_prover::proof_hash::ProvingHash;
-use rsmt_prover::table_a_demo::prove_and_verify_table_a;
-use rsmt_prover::table_f_demo::prove_and_verify_table_f;
+use rsmt_prover::proof_hash::{Blake3ProofHash, Poseidon2ProofHash, ProvingHash, Sha256ProofHash};
+use rsmt_prover::round::{RoundMetrics, prove_and_verify_round_metrics};
+use rsmt_witness::{TracePlan, build_plan};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "RSMT3 AIR proof-of-concept benchmarks")]
+#[command(version, about = "RSMT v6a arithmetization benchmarks")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -45,164 +42,216 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
-    /// End-to-end Poseidon2 proof over BabyBear via TwoAdicFriPcs.
-    Poseidon2 {
-        /// Number of permutations (must be VECTOR_LEN × pow-of-2).
-        #[arg(long, default_value_t = 1024)]
-        num_hashes: usize,
-    },
-    /// FRI prove+verify Table A in isolation.
-    TableA {
+    /// One end-to-end batch-STARK round with a per-table metrics breakdown.
+    Round {
         #[arg(long, default_value_t = 64)]
         batch: usize,
-        #[arg(long, default_value_t = 0)]
-        seed: u64,
-    },
-    /// FRI prove+verify Table F in isolation.
-    TableF {
-        #[arg(long, default_value_t = 64)]
-        batch: usize,
-        #[arg(long, default_value_t = 0)]
-        seed: u64,
-    },
-    /// `prove_batch` over all six AIRs with LogUp buses.
-    Batch {
-        #[arg(long, default_value_t = 16)]
-        batch: usize,
-        #[arg(long, default_value_t = 0)]
-        seed: u64,
-        #[arg(long, value_enum, default_value_t = ProofHashArg::Poseidon2)]
-        hash: ProofHashArg,
-    },
-    /// Sweep batch sizes through `prove_batch` and report per-table metrics.
-    Perf {
-        /// Comma-separated batch sizes (e.g. 16,64,256,1024).
-        #[arg(long, default_value = "16,64,256")]
-        batches: String,
-        /// Pre-insert this many random leaves before proving each measured batch.
         #[arg(long, default_value_t = 0)]
         prefill: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// FRI log_blowup (LDE rate). Larger → bigger LDE, fewer queries
-        /// for the same soundness, smaller proof.
-        #[arg(long, default_value_t = 1)]
-        log_blowup: usize,
-        /// FRI query count. Linear in proof size and verifier work.
-        #[arg(long, default_value_t = 100)]
-        num_queries: usize,
-        /// PoW grind bits before sampling queries. Shifts work to prover.
-        #[arg(long, default_value_t = 16)]
-        query_pow_bits: usize,
-        /// Max FRI folding arity (log2). 1 = binary folding.
-        #[arg(long, default_value_t = 3)]
-        max_log_arity: usize,
-        /// Proving PCS/transcript hash. `all` runs both suites.
-        #[arg(long, value_enum, default_value_t = PerfHashArg::Poseidon2)]
-        hash: PerfHashArg,
+        #[command(flatten)]
+        fri: FriArgs,
+        #[arg(long, value_enum, default_value_t = HashArg::Poseidon2)]
+        hash: HashArg,
+    },
+    /// Sweep batch sizes (and/or proof hashes) through `round`.
+    Perf {
+        /// Comma-separated batch sizes (e.g. 16,64,256).
+        #[arg(long, default_value = "16,64,256")]
+        batches: String,
+        #[arg(long, default_value_t = 0)]
+        prefill: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        #[command(flatten)]
+        fri: FriArgs,
+        /// Proving PCS/transcript hash. `all` runs every suite.
+        #[arg(long, value_enum, default_value_t = HashArg::Poseidon2)]
+        hash: HashArg,
     },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProofHashArg {
-    Poseidon2,
-    Sha256,
-    Blake3,
+/// FRI knobs shared by `round` and `perf`.
+#[derive(clap::Args, Debug)]
+struct FriArgs {
+    /// FRI log_blowup (LDE rate).
+    #[arg(long, default_value_t = 1)]
+    log_blowup: usize,
+    /// FRI query count (linear in proof size + verifier work).
+    #[arg(long, default_value_t = 100)]
+    num_queries: usize,
+    /// PoW grind bits before sampling queries.
+    #[arg(long, default_value_t = 16)]
+    query_pow_bits: usize,
+    /// Max FRI folding arity (log2).
+    #[arg(long, default_value_t = 3)]
+    max_log_arity: usize,
 }
 
-impl From<ProofHashArg> for ProvingHash {
-    fn from(value: ProofHashArg) -> Self {
-        match value {
-            ProofHashArg::Poseidon2 => Self::Poseidon2,
-            ProofHashArg::Sha256 => Self::Sha256,
-            ProofHashArg::Blake3 => Self::Blake3,
+impl FriArgs {
+    fn to_cfg(&self) -> ProverConfig {
+        ProverConfig {
+            log_blowup: self.log_blowup,
+            num_queries: self.num_queries,
+            query_proof_of_work_bits: self.query_pow_bits,
+            max_log_arity: self.max_log_arity,
+            ..ProverConfig::default()
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum PerfHashArg {
+enum HashArg {
     Poseidon2,
     Sha256,
     Blake3,
     All,
 }
 
-fn run_perf(batches: &str, prefill: usize, seed: u64, cfg: &ProverConfig, hash_arg: PerfHashArg) {
+impl HashArg {
+    fn suites(self) -> &'static [ProvingHash] {
+        match self {
+            HashArg::Poseidon2 => &[ProvingHash::Poseidon2],
+            HashArg::Sha256 => &[ProvingHash::Sha256],
+            HashArg::Blake3 => &[ProvingHash::Blake3],
+            HashArg::All => &[
+                ProvingHash::Poseidon2,
+                ProvingHash::Sha256,
+                ProvingHash::Blake3,
+            ],
+        }
+    }
+}
+
+fn rand_key(rng: &mut Xoshiro256PlusPlus) -> Key {
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    bytes_to_limbs(&bytes)
+}
+
+/// Build a self-validated round plan: prefill a tree, then apply `batch` fresh
+/// leaves and record the consistency proof. Returns the plan and its build time.
+fn build_round_plan(seed: u64, prefill: usize, batch: usize) -> (TracePlan, Duration) {
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let mut tree: Tree<Poseidon2Hasher> = Tree::new();
+    if prefill > 0 {
+        let pre: Vec<KeyValue> = (0..prefill)
+            .map(|_| (rand_key(&mut rng), vec![1u8; 8]))
+            .collect();
+        tree.batch_insert(pre);
+    }
+    let old = tree.root_hash();
+    let b: Vec<KeyValue> = (0..batch)
+        .map(|_| (rand_key(&mut rng), vec![2u8; 8]))
+        .collect();
+    let (applied, proof) = tree.batch_insert(b);
+    let new = tree.root_hash().expect("non-empty after batch");
+
+    let t = Instant::now();
+    let plan = build_plan(&proof, &applied, old.as_ref(), &new).expect("build_plan");
+    (plan, t.elapsed())
+}
+
+/// Dispatch the measured round to the requested proving-hash suite.
+fn measure(plan: &TracePlan, seed: u64, cfg: &ProverConfig, hash: ProvingHash) -> RoundMetrics {
+    let r = match hash {
+        ProvingHash::Poseidon2 => {
+            prove_and_verify_round_metrics::<Poseidon2ProofHash>(plan, seed, cfg)
+        }
+        ProvingHash::Sha256 => prove_and_verify_round_metrics::<Sha256ProofHash>(plan, seed, cfg),
+        ProvingHash::Blake3 => prove_and_verify_round_metrics::<Blake3ProofHash>(plan, seed, cfg),
+    };
+    r.expect("prove+verify")
+}
+
+fn print_tables(m: &RoundMetrics) {
+    println!(
+        "  {:>2} {:>8} {:>8} {:>6} {:>5} {:>12}",
+        "T", "real", "padded", "main", "prep", "cells"
+    );
+    for t in &m.tables {
+        println!(
+            "  {:>2} {:>8} {:>8} {:>6} {:>5} {:>12}",
+            t.name,
+            t.real_rows,
+            t.padded_height,
+            t.main_width,
+            t.prep_width,
+            t.cells(),
+        );
+    }
+    println!(
+        "  total cells={} max_main_width={} proof={:.1} KB",
+        m.total_cells(),
+        m.max_main_width(),
+        m.proof_bytes as f64 / 1024.0,
+    );
+    println!(
+        "  trace={:?} prove={:?} verify={:?}",
+        m.trace_time, m.prove_time, m.verify_time
+    );
+}
+
+fn run_round(batch: usize, prefill: usize, seed: u64, cfg: &ProverConfig, hash: HashArg) {
+    let (plan, wit) = build_round_plan(seed, prefill, batch);
+    println!(
+        "round: prefill={prefill} batch={batch} (L={} N={} O={} S={}) witness={wit:?}",
+        plan.shape.n_l, plan.shape.n_join, plan.shape.n_open, plan.shape.n_s,
+    );
+    for &h in hash.suites() {
+        println!("proof_hash={}", h.name());
+        let m = measure(&plan, seed, cfg, h);
+        print_tables(&m);
+    }
+}
+
+fn run_perf(batches: &str, prefill: usize, seed: u64, cfg: &ProverConfig, hash: HashArg) {
     let sizes: Vec<usize> = batches
         .split(',')
         .map(|s| s.trim().parse().expect("batch size"))
         .collect();
-    let hashes: &[ProvingHash] = match hash_arg {
-        PerfHashArg::Poseidon2 => &[ProvingHash::Poseidon2],
-        PerfHashArg::Sha256 => &[ProvingHash::Sha256],
-        PerfHashArg::Blake3 => &[ProvingHash::Blake3],
-        PerfHashArg::All => &[
-            ProvingHash::Poseidon2,
-            ProvingHash::Sha256,
-            ProvingHash::Blake3,
-        ],
-    };
-
-    for &hash in hashes {
-        println!("proof_hash={}", hash.name());
-        println!("prefill={prefill}");
+    println!(
+        "FRI: log_blowup={} num_queries={} query_pow_bits={} max_log_arity={} (~{} conjectured bits)",
+        cfg.log_blowup,
+        cfg.num_queries,
+        cfg.query_proof_of_work_bits,
+        cfg.max_log_arity,
+        cfg.conjectured_soundness_bits(),
+    );
+    for &h in hash.suites() {
+        println!("proof_hash={} prefill={prefill}", h.name());
         println!(
-            "FRI: log_blowup={} num_queries={} query_pow_bits={} max_log_arity={} (~{} conjectured soundness bits)",
-            cfg.log_blowup,
-            cfg.num_queries,
-            cfg.query_proof_of_work_bits,
-            cfg.max_log_arity,
-            cfg.conjectured_soundness_bits(),
-        );
-        println!(
-            "{:>5} {:>8} {:>8} {:>10} {:>12} {:>10} {:>9} {:>9} {:>10} {:>10}",
+            "{:>6} {:>7} {:>7} {:>9} {:>13} {:>6} {:>7} {:>9} {:>10} {:>9}",
             "batch",
-            "L_ops",
-            "N_ops",
+            "L",
+            "N",
             "B_perms",
             "cells",
+            "maxW",
             "wit_ms",
-            "trace_ms",
             "prove_ms",
             "verify_ms",
             "proof_KB",
         );
         for &b in &sizes {
-            let m = prove_and_verify_with_metrics_cfg_hash_prefill(seed, prefill, b, cfg, hash);
+            let (plan, wit) = build_round_plan(seed, prefill, b);
+            let m = measure(&plan, seed, cfg, h);
             println!(
-                "{:>5} {:>8} {:>8} {:>10} {:>12} {:>10} {:>9} {:>9} {:>10} {:>10.1}",
-                m.batch_size,
+                "{:>6} {:>7} {:>7} {:>9} {:>13} {:>6} {:>7} {:>9} {:>10} {:>9.1}",
+                b,
                 m.n_l,
-                m.n_n,
+                m.n_join,
                 m.b_real_perms,
                 m.total_cells(),
-                m.witness_time.as_millis(),
-                m.trace_time.as_millis(),
+                m.max_main_width(),
+                wit.as_millis(),
                 m.prove_time.as_millis(),
                 m.verify_time.as_millis(),
                 m.proof_bytes as f64 / 1024.0,
             );
-            println!("  per-table (name real/padded main+prep cells):");
-            for t in &m.tables {
-                println!(
-                    "    {:>2}: {:>6}/{:<6} {:>3}+{:<2} = {:>10}",
-                    t.name,
-                    t.real_rows,
-                    t.padded_height,
-                    t.main_width,
-                    t.prep_width,
-                    t.cells(),
-                );
-            }
         }
     }
-}
-
-fn rand_key(rng: &mut Xoshiro256PlusPlus) -> BigUint {
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    BigUint::from_bytes_be(&bytes)
 }
 
 fn run_smt(prefill: usize, batch_size: usize, seed: u64) {
@@ -210,16 +259,16 @@ fn run_smt(prefill: usize, batch_size: usize, seed: u64) {
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
 
     if prefill > 0 {
-        let pre: Vec<_> = (0..prefill)
-            .map(|_| (rand_key(&mut rng), vec![0u8; 32]))
+        let pre: Vec<KeyValue> = (0..prefill)
+            .map(|_| (rand_key(&mut rng), vec![1u8; 8]))
             .collect();
         let t = Instant::now();
         tree.batch_insert(pre);
-        println!("prefilled {} leaves in {:?}", prefill, t.elapsed());
+        println!("prefilled {prefill} leaves in {:?}", t.elapsed());
     }
 
-    let batch: Vec<_> = (0..batch_size)
-        .map(|_| (rand_key(&mut rng), vec![0u8; 32]))
+    let batch: Vec<KeyValue> = (0..batch_size)
+        .map(|_| (rand_key(&mut rng), vec![2u8; 8]))
         .collect();
     let pre_root = tree.root_hash();
     let t = Instant::now();
@@ -232,41 +281,16 @@ fn run_smt(prefill: usize, batch_size: usize, seed: u64) {
         .expect("verify");
     let dt_verify = t.elapsed();
 
-    let n_l = proof
-        .iter()
-        .filter(|o| matches!(o, rsmt_core::Op::L))
-        .count();
-    let n_n = proof
-        .iter()
-        .filter(|o| matches!(o, rsmt_core::Op::N(_)))
-        .count();
-    let n_s = proof
-        .iter()
-        .filter(|o| matches!(o, rsmt_core::Op::S(_)))
-        .count();
+    let count = |pred: fn(&rsmt_core::Op<rsmt_hash::Digest>) -> bool| {
+        proof.iter().filter(|o| pred(o)).count()
+    };
+    let n_l = count(|o| matches!(o, rsmt_core::Op::L));
+    let n_n = count(|o| matches!(o, rsmt_core::Op::N { .. }));
+    let n_s = count(|o| matches!(o, rsmt_core::Op::S(_)));
     println!(
-        "batch={} inserted={} proof ops: L={} N={} S={} total={} | insert={:?} verify={:?}",
-        batch_size,
+        "batch={batch_size} inserted={} proof ops: L={n_l} N={n_n} S={n_s} total={} | insert={dt_insert:?} verify={dt_verify:?}",
         items.len(),
-        n_l,
-        n_n,
-        n_s,
         proof.len(),
-        dt_insert,
-        dt_verify
-    );
-}
-
-fn run_poseidon2(num_hashes: usize) {
-    assert!(
-        num_hashes.is_multiple_of(P2_VECTOR_LEN) && (num_hashes / P2_VECTOR_LEN).is_power_of_two(),
-        "num_hashes must be VECTOR_LEN ({P2_VECTOR_LEN}) × power of 2"
-    );
-    let t = Instant::now();
-    prove_and_verify_poseidon2(num_hashes);
-    println!(
-        "Poseidon2 proof+verify for {num_hashes} perms: {:?}",
-        t.elapsed()
     );
 }
 
@@ -285,51 +309,19 @@ fn main() {
             batch,
             seed,
         } => run_smt(prefill, batch, seed),
-        Cmd::Poseidon2 { num_hashes } => run_poseidon2(num_hashes),
-        Cmd::TableA { batch, seed } => {
-            let t = Instant::now();
-            prove_and_verify_table_a(seed, batch);
-            println!(
-                "Table A FRI prove+verify (batch={batch}): {:?}",
-                t.elapsed()
-            );
-        }
-        Cmd::TableF { batch, seed } => {
-            let t = Instant::now();
-            prove_and_verify_table_f(seed, batch);
-            println!(
-                "Table F FRI prove+verify (batch={batch}): {:?}",
-                t.elapsed()
-            );
-        }
-        Cmd::Batch { batch, seed, hash } => {
-            let t = Instant::now();
-            let cfg = ProverConfig::default();
-            let _ = prove_and_verify_with_metrics_cfg_hash(seed, batch, &cfg, hash.into());
-            println!(
-                "Batch all AIRs prove+verify (batch={batch}, hash={}): {:?}",
-                ProvingHash::from(hash).name(),
-                t.elapsed()
-            );
-        }
+        Cmd::Round {
+            batch,
+            prefill,
+            seed,
+            fri,
+            hash,
+        } => run_round(batch, prefill, seed, &fri.to_cfg(), hash),
         Cmd::Perf {
             batches,
             prefill,
             seed,
-            log_blowup,
-            num_queries,
-            query_pow_bits,
-            max_log_arity,
+            fri,
             hash,
-        } => {
-            let cfg = ProverConfig {
-                log_blowup,
-                num_queries,
-                query_proof_of_work_bits: query_pow_bits,
-                max_log_arity,
-                ..ProverConfig::default()
-            };
-            run_perf(&batches, prefill, seed, &cfg, hash);
-        }
+        } => run_perf(&batches, prefill, seed, &fri.to_cfg(), hash),
     }
 }

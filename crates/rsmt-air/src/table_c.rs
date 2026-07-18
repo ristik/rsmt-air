@@ -1,60 +1,162 @@
-//! Table C (leaf sponge) AIR — three rows per `L`, with sponge transition
-//! constraints that fix `state_in` from the previous row's `state_out` plus
-//! the per-step injection of key/value limbs. `state_out` is tied to
-//! `Poseidon2(state_in)` via Bus 2 (deferred to M7).
+//! Table C — leaf sponge (DEVPLAN M3). Three rows per leaf replay the additive
+//! sponge (steps 0/1/2). Segmented **batch leaves then opened leaves** (D8
+//! analogue) via a preprocessed `kind` bit.
 //!
-//! Layout:
-//!   Main (50 cols):  key[0..9] | value[9..18] | state_in[18..34] | state_out[34..50]
-//!   Preprocessed (5 cols): leaf_idx | is_step_0 | is_step_1 | is_step_2 | is_real_c
+//! Local constraints (buses in M4): step-0 initialisation, the per-step
+//! additive injection linking `state_in` of a step to `state_out` of the
+//! previous step, key/value continuity within a leaf, `kind` booleanity, and
+//! padding hygiene. The permutation `state_out = P2(state_in)` itself is tied
+//! to Table B on Bus 2 (M4).
 
-use p3_air::symbolic::SymbolicAirBuilder;
-use p3_air::{Air, AirBuilder, AirLayout, BaseAir, BaseLeaf, SymbolicExpression, WindowAccess};
+use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_baby_bear::BabyBear;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_lookup::{Direction, Kind, Lookup, LookupAir, LookupInput};
+use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 
-use rsmt_hash::{DIGEST_WIDTH, DOMAIN_LEAF, LIMBS, STATE_WIDTH};
-use rsmt_witness::TableCRow;
+use rsmt_core::LIMBS;
+use rsmt_hash::{DOMAIN_LEAF, STATE_WIDTH};
+use rsmt_witness::{LeafKind, TracePlan};
 
-use crate::table_b::{BUS_POSEIDON2_NAME, BUS_POSEIDON2_TUPLE_WIDTH};
+use crate::cols::{cast, width_of};
 
-pub const TABLE_C_WIDTH: usize = LIMBS + LIMBS + STATE_WIDTH + STATE_WIDTH; // 9+9+16+16 = 50
-pub const TABLE_C_PREP_WIDTH: usize = 1 + 3 + 1; // leaf_idx + 3 step indicators + is_real_c
+/// Main columns (50): key[9], value[9], state_in[16], state_out[16].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CCols<T> {
+    pub key: [T; LIMBS],
+    pub value: [T; LIMBS],
+    pub state_in: [T; STATE_WIDTH],
+    pub state_out: [T; STATE_WIDTH],
+}
 
-const C_KEY: usize = 0; // 9 cols
-const C_VAL: usize = 9; // 9 cols
-const C_STATE_IN: usize = 18; // 16 cols
-const C_STATE_OUT: usize = 34; // 16 cols
+/// Preprocessed columns (7).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CPrepCols<T> {
+    pub leaf_idx: T,
+    pub is_step_0: T,
+    pub is_step_1: T,
+    pub is_step_2: T,
+    pub is_real: T,
+    pub kind: T,           // 0 = batch, 1 = opened
+    pub is_batch_step0: T, // step-0 of a batch leaf (Bus 6 receive gate)
+}
 
-const P_LEAF_IDX: usize = 0;
-const P_IS_STEP_0: usize = 1;
-const P_IS_STEP_1: usize = 2;
-const P_IS_STEP_2: usize = 3;
-const P_IS_REAL_C: usize = 4;
+pub const TABLE_C_WIDTH: usize = width_of::<CCols<u8>>();
+pub const TABLE_C_PREP_WIDTH: usize = width_of::<CPrepCols<u8>>();
 
-pub const BUS_LEAF_HASH_NAME: &str = "leaf_hash";
-pub const BUS_LEAF_HASH_TUPLE_WIDTH: usize = 1 + DIGEST_WIDTH; // 9
+const _: () = assert!(TABLE_C_WIDTH == 50);
 
-pub const BUS_BATCH_NAME: &str = "batch";
-pub const BUS_BATCH_TUPLE_WIDTH: usize = 1 + LIMBS + LIMBS; // 19
+pub const BUS_LEAF_NAME: &str = "leaf";
 
 #[derive(Clone)]
 pub struct TableCAir {
     pub padded_height: usize,
     pub real_rows: usize,
+    /// Number of batch-leaf rows (`3 · n_l`); rows below this are `kind = 0`.
+    pub batch_rows: usize,
     pub num_lookups: usize,
 }
 
 impl TableCAir {
-    pub const fn new(padded_height: usize, real_rows: usize) -> Self {
+    pub const fn new(padded_height: usize, real_rows: usize, batch_rows: usize) -> Self {
         Self {
             padded_height,
             real_rows,
+            batch_rows,
             num_lookups: 0,
         }
     }
 }
+
+impl<F: p3_field::Field> p3_lookup::LookupAir<F> for TableCAir {
+    fn add_lookup_columns(&mut self) -> Vec<usize> {
+        let idx = self.num_lookups;
+        self.num_lookups += 1;
+        vec![idx]
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn get_lookups(&mut self) -> Vec<p3_lookup::Lookup<F>> {
+        use p3_air::AirLayout;
+        use p3_air::symbolic::{SymbolicAirBuilder, SymbolicExpression};
+        use p3_lookup::{Direction, Kind};
+        type SE<F> = SymbolicExpression<F>;
+        self.num_lookups = 0;
+        let sb = SymbolicAirBuilder::<F>::new(AirLayout {
+            main_width: TABLE_C_WIDTH,
+            preprocessed_width: TABLE_C_PREP_WIDTH,
+            ..Default::default()
+        });
+        let main = sb.main();
+        let ml = main.current_slice();
+        let prep = sb.preprocessed();
+        let pl = prep.current_slice();
+        // Bus 4 (leaf): send (kind, idx, digest[8], key[9]) on step-2 rows.
+        // C layout: key[0..9], value[9..18], state_in[18..34], state_out[34..50].
+        // prep: leaf_idx(0), is_step_0(1), is_step_1(2), is_step_2(3), is_real(4), kind(5).
+        let mut tuple: Vec<SE<F>> = vec![pl[5].into(), pl[0].into()];
+        for j in 0..8 {
+            tuple.push(ml[34 + j].into());
+        }
+        for j in 0..9 {
+            tuple.push(ml[j].into());
+        }
+        let mut lookups = vec![p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(BUS_LEAF_NAME.to_string()),
+            &[(tuple, pl[3].into(), Direction::Send)],
+        )];
+
+        // Bus 6 (batch): receive (idx, key[9], value[9]) on batch step-0 rows.
+        let mut btuple: Vec<SE<F>> = vec![pl[0].into()];
+        for j in 0..9 {
+            btuple.push(ml[j].into()); // key
+        }
+        for j in 0..9 {
+            btuple.push(ml[9 + j].into()); // value
+        }
+        lookups.push(p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(BUS_BATCH_NAME.to_string()),
+            &[(btuple, pl[6].into(), Direction::Receive)],
+        ));
+
+        // Bus 2 split (D17). Steps 0/1 feed forward → receive the full
+        // (state_in[16], state_out[16]) on the feed-forward bus. Step 2 is
+        // terminal → receive the digest (state_in[16], state_out[0..8]) on the
+        // terminal bus. C prep: is_step_0=pl[1], is_step_1=pl[2], is_step_2=pl[3].
+        // C layout: state_in[18..34], state_out[34..50].
+        let ff_mult: SE<F> = SE::<F>::from(pl[1]) + SE::<F>::from(pl[2]);
+        let mut ff: Vec<SE<F>> = Vec::with_capacity(32);
+        for j in 0..16 {
+            ff.push(ml[18 + j].into());
+        }
+        for j in 0..16 {
+            ff.push(ml[34 + j].into());
+        }
+        lookups.push(p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(crate::table_b::BUS_P2FF_NAME.to_string()),
+            &[(ff, ff_mult, Direction::Receive)],
+        ));
+        let mut term: Vec<SE<F>> = Vec::with_capacity(24);
+        for j in 0..16 {
+            term.push(ml[18 + j].into());
+        }
+        for j in 0..8 {
+            term.push(ml[34 + j].into());
+        }
+        lookups.push(p3_lookup::LookupAir::register_lookup(
+            self,
+            Kind::Global(crate::table_b::BUS_P2TERM_NAME.to_string()),
+            &[(term, pl[3].into(), Direction::Receive)],
+        ));
+        lookups
+    }
+}
+
+pub const BUS_BATCH_NAME: &str = "batch";
 
 impl<F: PrimeCharacteristicRing + Send + Sync> BaseAir<F> for TableCAir {
     fn width(&self) -> usize {
@@ -66,13 +168,23 @@ impl<F: PrimeCharacteristicRing + Send + Sync> BaseAir<F> for TableCAir {
         let mut data = Vec::with_capacity(h * TABLE_C_PREP_WIDTH);
         for i in 0..h {
             let is_real = i < self.real_rows;
-            let leaf_idx = if is_real { (i / 3) as u32 } else { 0 };
-            let step = if is_real { i % 3 } else { 0xFF };
+            // Per-kind leaf index (matches A's batch_idx / opened_idx on Bus 4).
+            let leaf_idx = if !is_real {
+                0
+            } else if i < self.batch_rows {
+                (i / 3) as u32
+            } else {
+                ((i - self.batch_rows) / 3) as u32
+            };
+            let step = if is_real { i % 3 } else { usize::MAX };
+            let kind = is_real && i >= self.batch_rows;
             data.push(F::from_u32(leaf_idx));
             data.push(F::from_bool(is_real && step == 0));
             data.push(F::from_bool(is_real && step == 1));
             data.push(F::from_bool(is_real && step == 2));
             data.push(F::from_bool(is_real));
+            data.push(F::from_bool(kind));
+            data.push(F::from_bool(is_real && step == 0 && !kind));
         }
         Some(RowMajorMatrix::new(data, TABLE_C_PREP_WIDTH))
     }
@@ -86,171 +198,106 @@ impl<AB: AirBuilder> Air<AB> for TableCAir
 where
     AB::F: Send,
 {
+    #[allow(clippy::type_complexity)]
     fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let local = main.current_slice().to_vec();
-        let next = main.next_slice().to_vec();
-        let prep = builder.preprocessed();
-        let prep_local = prep.current_slice().to_vec();
-        let prep_next = prep.next_slice().to_vec();
+        // Copy the row structs out as owned values so no builder borrow lingers
+        // across the `assert_zero` calls below.
+        let (local, next, pl, pn, row): (
+            CCols<AB::Var>,
+            CCols<AB::Var>,
+            CPrepCols<AB::Var>,
+            CPrepCols<AB::Var>,
+            Vec<AB::Var>,
+        ) = {
+            let main = builder.main();
+            let prep = builder.preprocessed();
+            (
+                *cast(main.current_slice()),
+                *cast(main.next_slice()),
+                *cast(prep.current_slice()),
+                *cast(prep.next_slice()),
+                main.current_slice().to_vec(),
+            )
+        };
 
         let one = AB::Expr::ONE;
-        let domain_leaf = AB::Expr::from(AB::F::from_u32(DOMAIN_LEAF));
+        let e = |v: AB::Var| -> AB::Expr { v.into() };
+        let domain_leaf = AB::Expr::from_u32(DOMAIN_LEAF);
 
-        let is_real_c = prep_local[P_IS_REAL_C];
-        let is_step_0 = prep_local[P_IS_STEP_0];
-        let is_step_1_next = prep_next[P_IS_STEP_1];
-        let is_step_2_next = prep_next[P_IS_STEP_2];
+        let is_real = e(pl.is_real);
+        let is_step_0 = e(pl.is_step_0);
+        let is_step_1_next = e(pn.is_step_1);
+        let is_step_2_next = e(pn.is_step_2);
 
-        // Padding: every witness column is zero on non-real rows.
-        let not_real = one.clone() - is_real_c;
-        for j in 0..TABLE_C_WIDTH {
-            builder.assert_zero(not_real.clone() * local[j]);
+        // Padding hygiene: every witness column zero on non-real rows.
+        let not_real = one.clone() - is_real.clone();
+        for &cell in &row {
+            builder.assert_zero(not_real.clone() * e(cell));
         }
 
-        // Step 0 initialization: state_in is fully determined by key.
-        // state_in[0] = DOMAIN_LEAF
-        builder.assert_zero(is_step_0 * (local[C_STATE_IN + 0] - domain_leaf.clone()));
-        // state_in[1+j] = key[j] for j=0..7
+        // kind booleanity (padding rows zero kind, so no is_real gate needed).
+        builder.assert_zero(e(pl.kind) * (e(pl.kind) - one.clone()));
+
+        // Step 0 init: state_in = [DOMAIN_LEAF, key[0..7], 0×8].
+        builder.assert_zero(is_step_0.clone() * (e(local.state_in[0]) - domain_leaf));
         for j in 0..7 {
-            builder.assert_zero(is_step_0 * (local[C_STATE_IN + 1 + j] - local[C_KEY + j]));
+            builder.assert_zero(is_step_0.clone() * (e(local.state_in[1 + j]) - e(local.key[j])));
         }
-        // state_in[8..16] = 0
         for j in 0..8 {
-            builder.assert_zero(is_step_0 * local[C_STATE_IN + 8 + j]);
+            builder.assert_zero(is_step_0.clone() * e(local.state_in[8 + j]));
         }
 
-        // Cross-row transitions: when next is step 1 or step 2, next.state_in
-        // is constrained against local.state_out + injection.
-        //
-        // Step 1 injection (indices into state_in): [0]+=key[7], [1]+=key[8],
-        // [2..8]+=value[0..6]. Indices [8..16] carry from prev.
+        // Step transitions: next.state_in = local.state_out + injection.
         for j in 0..STATE_WIDTH {
-            let inj_step1 = match j {
-                0 => local[C_KEY + 7].into(),
-                1 => local[C_KEY + 8].into(),
-                2..=7 => local[C_VAL + (j - 2)].into(),
+            let inj1: AB::Expr = match j {
+                0 => e(local.key[7]),
+                1 => e(local.key[8]),
+                2..=7 => e(local.value[j - 2]),
                 _ => AB::Expr::ZERO,
             };
-            let inj_step2: AB::Expr = match j {
-                0 => local[C_VAL + 6].into(),
-                1 => local[C_VAL + 7].into(),
-                2 => local[C_VAL + 8].into(),
+            let inj2: AB::Expr = match j {
+                0 => e(local.value[6]),
+                1 => e(local.value[7]),
+                2 => e(local.value[8]),
                 _ => AB::Expr::ZERO,
             };
             builder.assert_zero(
-                is_step_1_next * (next[C_STATE_IN + j] - local[C_STATE_OUT + j] - inj_step1),
+                is_step_1_next.clone() * (e(next.state_in[j]) - e(local.state_out[j]) - inj1),
             );
             builder.assert_zero(
-                is_step_2_next * (next[C_STATE_IN + j] - local[C_STATE_OUT + j] - inj_step2),
+                is_step_2_next.clone() * (e(next.state_in[j]) - e(local.state_out[j]) - inj2),
             );
         }
 
-        // Continuity of key/value across same-leaf transitions (when next is
-        // step 1 or step 2, i.e., not a leaf boundary).
+        // key/value continuity within a leaf (same-leaf transitions only).
         let cont = is_step_1_next + is_step_2_next;
         for j in 0..LIMBS {
-            builder.assert_zero(cont.clone() * (next[C_KEY + j] - local[C_KEY + j]));
-            builder.assert_zero(cont.clone() * (next[C_VAL + j] - local[C_VAL + j]));
+            builder.assert_zero(cont.clone() * (e(next.key[j]) - e(local.key[j])));
+            builder.assert_zero(cont.clone() * (e(next.value[j]) - e(local.value[j])));
         }
     }
 }
 
-impl<F: Field> LookupAir<F> for TableCAir {
-    fn add_lookup_columns(&mut self) -> Vec<usize> {
-        let idx = self.num_lookups;
-        self.num_lookups += 1;
-        vec![idx]
-    }
+// -- trace generation -------------------------------------------------------
 
-    fn get_lookups(&mut self) -> Vec<Lookup<F>> {
-        self.num_lookups = 0;
-        let layout = AirLayout {
-            main_width: TABLE_C_WIDTH,
-            preprocessed_width: TABLE_C_PREP_WIDTH,
-            ..Default::default()
-        };
-        let sb = SymbolicAirBuilder::<F>::new(layout);
-        let main = sb.main();
-        let main_local = main.current_slice();
-        let prep = sb.preprocessed();
-        let prep_local = prep.current_slice();
-
-        let is_last_step: SymbolicExpression<F> = prep_local[P_IS_STEP_2].into();
-
-        // Bus 4 (leaf_hash) send: (leaf_idx, state_out[0..8]) on last step.
-        let mut leaf_tuple: Vec<SymbolicExpression<F>> =
-            Vec::with_capacity(BUS_LEAF_HASH_TUPLE_WIDTH);
-        leaf_tuple.push(prep_local[P_LEAF_IDX].into());
-        for j in 0..DIGEST_WIDTH {
-            leaf_tuple.push(main_local[C_STATE_OUT + j].into());
-        }
-        let leaf_inputs: Vec<LookupInput<F>> =
-            vec![(leaf_tuple, is_last_step.clone(), Direction::Send)];
-        let leaf_lookup = LookupAir::register_lookup(
-            self,
-            Kind::Global(BUS_LEAF_HASH_NAME.to_string()),
-            &leaf_inputs,
-        );
-
-        // Bus 6 (batch) receive: (leaf_idx, key[9], value[9]) on last step.
-        let mut batch_tuple: Vec<SymbolicExpression<F>> = Vec::with_capacity(BUS_BATCH_TUPLE_WIDTH);
-        batch_tuple.push(prep_local[P_LEAF_IDX].into());
-        for j in 0..LIMBS {
-            batch_tuple.push(main_local[C_KEY + j].into());
-        }
-        for j in 0..LIMBS {
-            batch_tuple.push(main_local[C_VAL + j].into());
-        }
-        let batch_inputs: Vec<LookupInput<F>> =
-            vec![(batch_tuple, is_last_step, Direction::Receive)];
-        let batch_lookup = LookupAir::register_lookup(
-            self,
-            Kind::Global(BUS_BATCH_NAME.to_string()),
-            &batch_inputs,
-        );
-
-        // Bus 2 (Poseidon2) receive: each real C row is one sponge
-        // permutation, with the full input and full output state.
-        let is_real_c: SymbolicExpression<F> = prep_local[P_IS_REAL_C].into();
-        let mut p2_tuple: Vec<SymbolicExpression<F>> =
-            Vec::with_capacity(BUS_POSEIDON2_TUPLE_WIDTH);
-        for j in 0..STATE_WIDTH {
-            p2_tuple.push(main_local[C_STATE_IN + j].into());
-        }
-        for j in 0..STATE_WIDTH {
-            p2_tuple.push(main_local[C_STATE_OUT + j].into());
-        }
-        let p2_inputs: Vec<LookupInput<F>> = vec![(p2_tuple, is_real_c, Direction::Receive)];
-        let p2_lookup = LookupAir::register_lookup(
-            self,
-            Kind::Global(BUS_POSEIDON2_NAME.to_string()),
-            &p2_inputs,
-        );
-
-        let _ = SymbolicExpression::<F>::Leaf(BaseLeaf::Constant(F::ONE));
-        vec![leaf_lookup, batch_lookup, p2_lookup]
-    }
-}
-
-/// Build Table C's main trace (BabyBear) from witness rows; pads to the next
-/// power-of-two height (≥ 2). Returns `(trace, real, height)`.
-pub fn build_trace_babybear(rows: &[TableCRow]) -> (RowMajorMatrix<BabyBear>, usize, usize) {
-    let real = rows.len();
+/// Build Table C's main trace from the plan (batch leaves, then opened leaves).
+/// Returns `(trace, real_rows, height, batch_rows)`.
+pub fn build_trace(plan: &TracePlan) -> (RowMajorMatrix<BabyBear>, usize, usize, usize) {
+    let arena = plan.arena.entries();
+    let leaves: Vec<_> = plan.c_batch.iter().chain(plan.c_opened.iter()).collect();
+    let batch_rows = 3 * plan.c_batch.len();
+    let real = 3 * leaves.len();
     let height = real.next_power_of_two().max(2);
     let mut data = Vec::with_capacity(height * TABLE_C_WIDTH);
-    for r in rows {
-        for j in 0..LIMBS {
-            data.push(r.key[j]);
-        }
-        for j in 0..LIMBS {
-            data.push(r.value[j]);
-        }
-        for j in 0..STATE_WIDTH {
-            data.push(r.state_in[j]);
-        }
-        for j in 0..STATE_WIDTH {
-            data.push(r.state_out[j]);
+
+    for leaf in &leaves {
+        debug_assert!(leaf.kind == LeafKind::Batch || leaf.kind == LeafKind::Opened);
+        for step in 0..3 {
+            let io = arena[leaf.perm_idx[step] as usize];
+            data.extend_from_slice(&leaf.key);
+            data.extend_from_slice(&leaf.value);
+            data.extend_from_slice(&io.input);
+            data.extend_from_slice(&io.output);
         }
     }
     for _ in real..height {
@@ -258,35 +305,13 @@ pub fn build_trace_babybear(rows: &[TableCRow]) -> (RowMajorMatrix<BabyBear>, us
             data.push(BabyBear::ZERO);
         }
     }
-    (RowMajorMatrix::new(data, TABLE_C_WIDTH), real, height)
+    (
+        RowMajorMatrix::new(data, TABLE_C_WIDTH),
+        real,
+        height,
+        batch_rows,
+    )
 }
 
 #[cfg(test)]
-mod tests {
-    use num_bigint::BigUint;
-    use p3_air::check_constraints;
-    use rand::{RngExt, SeedableRng};
-    use rand_xoshiro::Xoshiro256PlusPlus;
-
-    use rsmt_witness::build_table_c;
-
-    use super::*;
-
-    #[test]
-    fn table_c_constraints_pass() {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(13);
-        let batch: Vec<(BigUint, Vec<u8>)> = (0..8)
-            .map(|_| {
-                let mut k = [0u8; 32];
-                rng.fill(&mut k);
-                let mut v = [0u8; 32];
-                rng.fill(&mut v);
-                (BigUint::from_bytes_be(&k), v.to_vec())
-            })
-            .collect();
-        let rows = build_table_c(&batch);
-        let (trace, real, height) = build_trace_babybear(&rows);
-        let air = TableCAir::new(height, real);
-        check_constraints(&air, &trace, &[]);
-    }
-}
+mod tests;
