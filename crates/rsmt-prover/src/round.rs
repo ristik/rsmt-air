@@ -78,6 +78,16 @@ pub struct RoundTraces<'a> {
 }
 
 /// Prove all seven tables for a round and verify the proof (single process).
+///
+/// **EXPERIMENTAL — not an external-verifier security boundary (R3/M0-⑨).**
+/// This entry point (a) proves and verifies in one process against
+/// prover-constructed preprocessing (`ProverData::common` carries the batch,
+/// finding §4), (b) takes a caller `seed` that derives the Poseidon2 proof-hash
+/// constants, and (c) accepts a caller `ProverConfig` for FRI parameters. A real
+/// external verifier does none of these. It is retained only as a differential
+/// and performance oracle until the R3 `prepare_verifier` / `prove_round` /
+/// `verify_round` split lands (M7); it must not be treated as the production
+/// protocol. See `docs/r3/01-security-model.md` §1 and `DEVPLAN-R3.md` §4.
 pub fn prove_and_verify_round<H: ProvingHashSuite>(
     plan: &TracePlan,
     seed: u64,

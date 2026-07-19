@@ -16,7 +16,7 @@ use p3_field::PrimeCharacteristicRing;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use rsmt_core::{Key, KeyValue, Tree, bytes_to_limbs};
+use rsmt_core::{Key, KeyValue, Tree, Value32, bytes_to_limbs};
 use rsmt_hash::Poseidon2Hasher;
 use rsmt_witness::{TracePlan, build_plan};
 
@@ -58,12 +58,12 @@ fn rich_plan(seed: u64, prefill: usize, batch: usize) -> TracePlan {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
     let b1: Vec<KeyValue> = (0..prefill)
-        .map(|_| (rand_key(&mut rng), vec![1u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([1u8; 32])))
         .collect();
     tree.batch_insert(b1);
     let old = tree.root_hash();
     let b2: Vec<KeyValue> = (0..batch)
-        .map(|_| (rand_key(&mut rng), vec![2u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([2u8; 32])))
         .collect();
     let (applied, proof) = tree.batch_insert(b2);
     let new = tree.root_hash().unwrap();

@@ -13,15 +13,16 @@ use core::fmt::Debug;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::limbs::{KEY_BITS, Key, limbs_to_bytes};
+use crate::limbs::{KEY_BITS, Key, Value32, limbs_to_bytes};
 
 /// A tree hash function. Node hashing binds the absolute `(depth, region)` of
 /// the junction; leaf hashing binds `(key, value)`.
 pub trait Hasher: Clone {
     type Digest: Clone + Eq + Debug;
 
-    /// Hash a leaf. `key` is MSB-first limbs; `value` is raw bytes.
-    fn hash_leaf(key: &Key, value: &[u8]) -> Self::Digest;
+    /// Hash a leaf. `key` is MSB-first limbs; `value` is an exact 32-byte
+    /// `Value32` (no length, no truncation — R3-D1).
+    fn hash_leaf(key: &Key, value: &Value32) -> Self::Digest;
 
     /// Hash a junction at absolute `depth` (`< 256`) with canonical
     /// left-aligned `region` limbs and child digests `lh`, `rh`.
@@ -31,7 +32,7 @@ pub trait Hasher: Clone {
 /// SHA-256 reference hasher matching `rsmt6a.py`:
 ///
 /// ```text
-/// H_leaf(key, value)   = SHA256(0x00 || key_32B || value)
+/// H_leaf(key, value)   = SHA256(0x00 || key_32B || value_32B)
 /// H_node(d, region, l, r) = SHA256(0x01 || d_1B || region_32B || l || r)
 /// ```
 ///
@@ -43,11 +44,11 @@ pub struct Sha256RefHasher;
 impl Hasher for Sha256RefHasher {
     type Digest = [u8; 32];
 
-    fn hash_leaf(key: &Key, value: &[u8]) -> [u8; 32] {
+    fn hash_leaf(key: &Key, value: &Value32) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update([0x00]);
         h.update(limbs_to_bytes(key));
-        h.update(value);
+        h.update(value.as_bytes());
         h.finalize().into()
     }
 

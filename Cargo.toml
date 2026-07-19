@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rsmt-core",
     "crates/rsmt-hash",
+    "crates/rsmt-protocol",
     "crates/rsmt-witness",
     "crates/rsmt-air",
     "crates/rsmt-prover",
@@ -45,6 +46,7 @@ p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "4b341cc9a19baf5f4
 # Internal crates
 rsmt-core = { path = "crates/rsmt-core" }
 rsmt-hash = { path = "crates/rsmt-hash" }
+rsmt-protocol = { path = "crates/rsmt-protocol" }
 rsmt-witness = { path = "crates/rsmt-witness" }
 rsmt-air = { path = "crates/rsmt-air" }
 rsmt-prover = { path = "crates/rsmt-prover" }

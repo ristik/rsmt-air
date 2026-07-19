@@ -29,7 +29,7 @@ use rsmt_core::{
 use crate::r10::{R10_REAL, canonical_limb, r10_index, radix1024, variable_range};
 use rsmt_hash::{
     Digest, PermIo, Poseidon2Hasher, State, default_perm, digest_of, leaf_perm_io, limbs_to_field,
-    node_children_io, node_prefix_io, pack_value_32,
+    node_children_io, node_prefix_io, value_field_limbs,
 };
 
 type F = BabyBear;
@@ -422,7 +422,7 @@ pub fn build_plan(
 
             Op::OL { key, value } => {
                 let key_f = limbs_to_field(key);
-                let value_f = pack_value_32(value);
+                let value_f = value_field_limbs(value);
                 let ios = leaf_perm_io(&perm, &key_f, &value_f);
                 let perm_idx = [
                     arena.intern(ios[0], true),  // step 0 → step 1
@@ -465,7 +465,7 @@ pub fn build_plan(
             Op::L => {
                 let (k, v) = sorted[bi as usize];
                 let key_f = limbs_to_field(k);
-                let value_f = pack_value_32(v);
+                let value_f = value_field_limbs(v);
                 let ios = leaf_perm_io(&perm, &key_f, &value_f);
                 let perm_idx = [
                     arena.intern(ios[0], true),  // step 0 → step 1

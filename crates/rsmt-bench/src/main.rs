@@ -17,7 +17,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-use rsmt_core::{Key, KeyValue, Tree, bytes_to_limbs, verify_consistency};
+use rsmt_core::{Key, KeyValue, Tree, Value32, bytes_to_limbs, verify_consistency};
 use rsmt_hash::Poseidon2Hasher;
 use rsmt_prover::config::ProverConfig;
 use rsmt_prover::proof_hash::{Blake3ProofHash, Poseidon2ProofHash, ProvingHash, Sha256ProofHash};
@@ -137,13 +137,13 @@ fn build_round_plan(seed: u64, prefill: usize, batch: usize) -> (TracePlan, Dura
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
     if prefill > 0 {
         let pre: Vec<KeyValue> = (0..prefill)
-            .map(|_| (rand_key(&mut rng), vec![1u8; 8]))
+            .map(|_| (rand_key(&mut rng), Value32::new([1u8; 32])))
             .collect();
         tree.batch_insert(pre);
     }
     let old = tree.root_hash();
     let b: Vec<KeyValue> = (0..batch)
-        .map(|_| (rand_key(&mut rng), vec![2u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([2u8; 32])))
         .collect();
     let (applied, proof) = tree.batch_insert(b);
     let new = tree.root_hash().expect("non-empty after batch");
@@ -260,7 +260,7 @@ fn run_smt(prefill: usize, batch_size: usize, seed: u64) {
 
     if prefill > 0 {
         let pre: Vec<KeyValue> = (0..prefill)
-            .map(|_| (rand_key(&mut rng), vec![1u8; 8]))
+            .map(|_| (rand_key(&mut rng), Value32::new([1u8; 32])))
             .collect();
         let t = Instant::now();
         tree.batch_insert(pre);
@@ -268,7 +268,7 @@ fn run_smt(prefill: usize, batch_size: usize, seed: u64) {
     }
 
     let batch: Vec<KeyValue> = (0..batch_size)
-        .map(|_| (rand_key(&mut rng), vec![2u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([2u8; 32])))
         .collect();
     let pre_root = tree.root_hash();
     let t = Instant::now();

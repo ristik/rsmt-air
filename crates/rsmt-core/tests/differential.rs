@@ -8,7 +8,9 @@
 //! Regenerate with:
 //!   python3 vectors/gen_vectors.py > crates/rsmt-core/tests/vectors.txt
 
-use rsmt_core::{Op, Sha256RefHasher, Tree, bytes_to_limbs, limbs_to_bytes, verify_consistency};
+use rsmt_core::{
+    Op, Sha256RefHasher, Tree, Value32, bytes_to_limbs, limbs_to_bytes, verify_consistency,
+};
 
 type H = Sha256RefHasher;
 type D = [u8; 32];
@@ -24,14 +26,10 @@ fn hex32(s: &str) -> D {
     out
 }
 
-fn hex_bytes(s: &str) -> Vec<u8> {
-    if s == "-" {
-        return Vec::new();
-    }
-    assert!(s.len() % 2 == 0);
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
-        .collect()
+/// Parse an exact 32-byte value from 64 hex chars (R3-D1: values are `Value32`;
+/// the corpus is regenerated with 32-byte values, so `"-"` no longer appears).
+fn hex_value(s: &str) -> Value32 {
+    Value32::new(hex32(s))
 }
 
 fn to_hex(b: &[u8]) -> String {
@@ -55,12 +53,11 @@ fn serialize_op(op: &Op<D>) -> String {
             to_hex(c_r)
         ),
         Op::OL { key, value } => {
-            let v = if value.is_empty() {
-                "-".to_string()
-            } else {
-                to_hex(value)
-            };
-            format!("OL {} {}", to_hex(&limbs_to_bytes(key)), v)
+            format!(
+                "OL {} {}",
+                to_hex(&limbs_to_bytes(key)),
+                to_hex(value.as_bytes())
+            )
         }
         Op::L => "L".to_string(),
         Op::N { depth } => format!("N {depth}"),
@@ -107,7 +104,7 @@ fn differential_against_rsmt6a() {
             for _ in 0..n {
                 let l = lines.next().unwrap();
                 let (kh, vh) = l.trim().split_once(' ').unwrap();
-                batch.push((bytes_to_limbs(&hex32(kh)), hex_bytes(vh)));
+                batch.push((bytes_to_limbs(&hex32(kh)), hex_value(vh)));
             }
 
             // APPLIED (expected)
@@ -123,7 +120,7 @@ fn differential_against_rsmt6a() {
             for _ in 0..a {
                 let l = lines.next().unwrap();
                 let (kh, vh) = l.trim().split_once(' ').unwrap();
-                expect_applied.push((bytes_to_limbs(&hex32(kh)), hex_bytes(vh)));
+                expect_applied.push((bytes_to_limbs(&hex32(kh)), hex_value(vh)));
             }
 
             let old = opt_root(lines.next().unwrap().trim().strip_prefix("OLD ").unwrap());

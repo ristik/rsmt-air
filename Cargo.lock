@@ -1161,6 +1161,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsmt-protocol"
+version = "0.1.0"
+dependencies = [
+ "p3-baby-bear",
+ "p3-field",
+ "rsmt-core",
+]
+
+[[package]]
 name = "rsmt-prover"
 version = "0.1.0"
 dependencies = [
@@ -1189,6 +1198,7 @@ dependencies = [
  "rsmt-air",
  "rsmt-core",
  "rsmt-hash",
+ "rsmt-protocol",
  "rsmt-witness",
  "serde",
  "tracing-forest",

@@ -20,7 +20,7 @@ use p3_field::PrimeCharacteristicRing;
 use p3_poseidon2_air::RoundConstants;
 use p3_symmetric::Permutation;
 
-use rsmt_core::{Hasher, Key, LIMBS, bytes_to_limbs};
+use rsmt_core::{Hasher, Key, LIMBS, Value32};
 
 /// Domain separator prepended to the leaf sponge.
 pub const DOMAIN_LEAF: u32 = 1;
@@ -56,13 +56,11 @@ pub fn limbs_to_field(limbs: &Key) -> [BabyBear; LIMBS] {
     core::array::from_fn(|i| BabyBear::from_u32(limbs[i]))
 }
 
-/// Pack a value (`≤ 32` bytes, right-aligned into 32) into 9 MSB-first field
-/// limbs, matching the key packing.
-pub fn pack_value_32(v: &[u8]) -> [BabyBear; LIMBS] {
-    let mut padded = [0u8; 32];
-    let n = v.len().min(32);
-    padded[32 - n..].copy_from_slice(&v[..n]);
-    limbs_to_field(&bytes_to_limbs(&padded))
+/// Pack an exact 32-byte [`Value32`] into 9 MSB-first field limbs, matching the
+/// key packing. Injective (R3-D1): the old `pack_value_32(&[u8])`, which
+/// truncated after 32 bytes and right-aligned shorter values, is deleted.
+pub fn value_field_limbs(v: &Value32) -> [BabyBear; LIMBS] {
+    limbs_to_field(&v.limbs())
 }
 
 /// Default deterministic Poseidon2 permutation (prover + verifier).
@@ -246,9 +244,9 @@ pub struct Poseidon2Hasher;
 impl Hasher for Poseidon2Hasher {
     type Digest = Digest;
 
-    fn hash_leaf(key: &Key, value: &[u8]) -> Self::Digest {
+    fn hash_leaf(key: &Key, value: &Value32) -> Self::Digest {
         let key_f = limbs_to_field(key);
-        let value_f = pack_value_32(value);
+        let value_f = value_field_limbs(value);
         PERM.with(|p| leaf_hash_with(p, &key_f, &value_f))
     }
 

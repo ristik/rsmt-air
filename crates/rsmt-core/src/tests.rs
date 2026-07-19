@@ -19,10 +19,19 @@ fn rand_key(rng: &mut Xoshiro256PlusPlus) -> Key {
     bytes_to_limbs(&bytes)
 }
 
-fn rand_value(rng: &mut Xoshiro256PlusPlus) -> Vec<u8> {
-    let mut v = vec![0u8; 8];
+fn rand_value(rng: &mut Xoshiro256PlusPlus) -> Value32 {
+    let mut v = [0u8; 32];
     rng.fill(v.as_mut_slice());
-    v
+    Value32::new(v)
+}
+
+/// Test helper: a `Value32` seeded from a short byte string (front-loaded,
+/// zero-padded to 32). Distinct seeds give distinct values.
+fn v32(seed: &[u8]) -> Value32 {
+    let mut b = [0u8; 32];
+    let n = seed.len().min(32);
+    b[..n].copy_from_slice(&seed[..n]);
+    Value32::new(b)
 }
 
 /// Drive `rounds` random batches through a fresh tree, verifying each round's
@@ -31,14 +40,14 @@ fn honest_history(
     seed: u64,
     rounds: usize,
     sizes: &[usize],
-) -> (std::collections::BTreeMap<Key, Vec<u8>>, Option<D>) {
+) -> (std::collections::BTreeMap<Key, Value32>, Option<D>) {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut tree: Tree<H> = Tree::new();
     let mut recorded = std::collections::BTreeMap::new();
     let mut root = tree.root_hash();
     for r in 0..rounds {
         let n = sizes[r % sizes.len()];
-        let batch: Vec<(Key, Vec<u8>)> = (0..n)
+        let batch: Vec<(Key, Value32)> = (0..n)
             .map(|_| (rand_key(&mut rng), rand_value(&mut rng)))
             .collect();
         let (applied, proof) = tree.batch_insert(batch);
@@ -75,9 +84,9 @@ fn empty_batch_is_identity() {
     // (genesis: old = new = None is not representable at the boundary here;
     //  test the non-empty-tree identity instead.)
     let k = key_from_u128(0x1234);
-    tree.batch_insert(vec![(k, vec![1])]);
+    tree.batch_insert(vec![(k, v32(&[1]))]);
     let root = tree.root_hash().unwrap();
-    let (items, proof) = tree.batch_insert(vec![(k, vec![2])]); // already present
+    let (items, proof) = tree.batch_insert(vec![(k, v32(&[2]))]); // already present
     assert!(items.is_empty() && proof.is_empty());
     assert!(verify_consistency::<H>(&proof, Some(&root), &root, &items).is_ok());
     // Non-empty proof with empty batch is rejected.
@@ -92,7 +101,7 @@ fn single_leaf_roundtrip() {
     let mut tree: Tree<H> = Tree::new();
     let k = key_from_u128(0x1234);
     let pre = tree.root_hash();
-    let (items, proof) = tree.batch_insert(vec![(k, vec![0xAA; 4])]);
+    let (items, proof) = tree.batch_insert(vec![(k, v32(&[0xAA; 4]))]);
     let post = tree.root_hash().unwrap();
     assert_eq!(proof, vec![Op::L]); // single new leaf, no junction
     verify_consistency::<H>(&proof, pre.as_ref(), &post, &items).unwrap();
@@ -109,9 +118,9 @@ fn valid_multi_round_history() {
 fn certificates_verify() {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(11);
     let mut tree: Tree<H> = Tree::new();
-    let mut recorded: Vec<(Key, Vec<u8>)> = Vec::new();
+    let mut recorded: Vec<(Key, Value32)> = Vec::new();
     for _ in 0..4 {
-        let batch: Vec<(Key, Vec<u8>)> = (0..40)
+        let batch: Vec<(Key, Value32)> = (0..40)
             .map(|_| (rand_key(&mut rng), rand_value(&mut rng)))
             .collect();
         let (applied, _) = tree.batch_insert(batch);
@@ -122,7 +131,7 @@ fn certificates_verify() {
         let cert = tree.inclusion_cert(k).expect("present key has cert");
         assert!(verify_inclusion::<H>(&cert, &root, k, v));
         // wrong value fails
-        assert!(!verify_inclusion::<H>(&cert, &root, k, b"wrong"));
+        assert!(!verify_inclusion::<H>(&cert, &root, k, &v32(b"wrong")));
     }
     // Absent keys: non-inclusion witnesses verify.
     let mut checked = 0;
@@ -140,10 +149,10 @@ fn certificates_verify() {
 }
 
 /// Build a multi-key tree and return (tree, root, a recorded key).
-fn tree_with_keys(seed: u64, n: usize) -> (Tree<H>, D, Vec<(Key, Vec<u8>)>) {
+fn tree_with_keys(seed: u64, n: usize) -> (Tree<H>, D, Vec<(Key, Value32)>) {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut tree: Tree<H> = Tree::new();
-    let batch: Vec<(Key, Vec<u8>)> = (0..n)
+    let batch: Vec<(Key, Value32)> = (0..n)
         .map(|_| (rand_key(&mut rng), rand_value(&mut rng)))
         .collect();
     let (applied, _) = tree.batch_insert(batch);
@@ -155,7 +164,7 @@ fn tree_with_keys(seed: u64, n: usize) -> (Tree<H>, D, Vec<(Key, Vec<u8>)>) {
 fn shadow_insertion_attack_rejected() {
     let (tree, root, applied) = tree_with_keys(6, 64);
     let k = applied[0].0;
-    let v_prime = b"equivocation".to_vec();
+    let v_prime = v32(b"equivocation");
     // first bit position where k has a 1 bit
     let d_star = (0..KEY_BITS).find(|&d| key_bit(&k, d) == 1).unwrap();
 
@@ -199,7 +208,7 @@ fn shadow_insertion_attack_rejected() {
 fn re_recording_present_key_rejected() {
     let (mut tree, root, applied) = tree_with_keys(7, 40);
     let k = applied[0].0;
-    let v_prime = b"equivocation".to_vec();
+    let v_prime = v32(b"equivocation");
 
     // honest path: dedup skips it
     let (a, p) = tree.batch_insert(vec![(k, v_prime.clone())]);
@@ -222,17 +231,9 @@ fn re_recording_present_key_rejected() {
 fn tamper_checks_rejected() {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(99);
     let mut tree: Tree<H> = Tree::new();
-    let (_a1, _p1) = tree.batch_insert(
-        (0..64)
-            .map(|_| (rand_key(&mut rng), b"a".to_vec()))
-            .collect(),
-    );
+    let (_a1, _p1) = tree.batch_insert((0..64).map(|_| (rand_key(&mut rng), v32(b"a"))).collect());
     let r1 = tree.root_hash().unwrap();
-    let (a2, p2) = tree.batch_insert(
-        (0..64)
-            .map(|_| (rand_key(&mut rng), b"b".to_vec()))
-            .collect(),
-    );
+    let (a2, p2) = tree.batch_insert((0..64).map(|_| (rand_key(&mut rng), v32(b"b"))).collect());
     let r2 = tree.root_hash().unwrap();
 
     // honest
@@ -274,7 +275,7 @@ fn tamper_checks_rejected() {
     }
 
     // change values
-    let changed_vals: Vec<(Key, Vec<u8>)> = a2.iter().map(|(k, _)| (*k, b"x".to_vec())).collect();
+    let changed_vals: Vec<(Key, Value32)> = a2.iter().map(|(k, _)| (*k, v32(b"x"))).collect();
     assert!(verify_consistency::<H>(&p2, Some(&r1), &r2, &changed_vals).is_err());
 }
 
@@ -293,7 +294,7 @@ proptest! {
     fn prop_mutation_rejected(seed in any::<u64>(), which in 0usize..64) {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
         let mut tree: Tree<H> = Tree::new();
-        let batch: Vec<(Key, Vec<u8>)> =
+        let batch: Vec<(Key, Value32)> =
             (0..16).map(|_| (rand_key(&mut rng), rand_value(&mut rng))).collect();
         let (applied, proof) = tree.batch_insert(batch);
         prop_assume!(!applied.is_empty());
@@ -323,8 +324,8 @@ proptest! {
 fn golden_root_and_stream_match_python() {
     // Batch: keys 1,2,3,...,8 (as 256-bit ints), values b"v0".. b"v7".
     // Golden values produced by `rsmt6a.py::batch_insert` on the same input.
-    let batch: Vec<(Key, Vec<u8>)> = (0u128..8)
-        .map(|i| (key_from_u128(i + 1), format!("v{i}").into_bytes()))
+    let batch: Vec<(Key, Value32)> = (0u128..8)
+        .map(|i| (key_from_u128(i + 1), v32(format!("v{i}").as_bytes())))
         .collect();
     let mut tree: Tree<H> = Tree::new();
     let (applied, proof) = tree.batch_insert(batch);
@@ -375,4 +376,7 @@ fn hex(d: &[u8; 32]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-const GOLDEN_ROOT: &str = "eea9dea8c27877e62cb5ef68b4f78cad0d6e46d4f5978c4f6b3d8d4d9bed22c9";
+// Golden root over 32-byte values `v32("v0")..v32("v7")` (front-loaded,
+// zero-padded), recomputed from `rsmt6a.py` after the R3-D1 exact-`Value32`
+// switch. The opcode stream depends only on keys, so it is unchanged.
+const GOLDEN_ROOT: &str = "39a6093229ef7b98fe2681f831140f2501d28e3f1462d4cef22331f25530b42f";

@@ -5,7 +5,7 @@ use p3_field::PrimeCharacteristicRing;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use rsmt_core::{Key, Op, Sha256RefHasher, Tree, bytes_to_limbs, region_limbs};
+use rsmt_core::{Key, Op, Sha256RefHasher, Tree, Value32, bytes_to_limbs, region_limbs};
 
 use super::*;
 
@@ -131,7 +131,7 @@ fn perm_io_reproduces_digests() {
 
     // leaf
     let key = limbs_to_field(&rand_key(&mut rng));
-    let value = pack_value_32(&[9u8; 32]);
+    let value = value_field_limbs(&Value32::new([9u8; 32]));
     let pairs = leaf_perm_io(&perm, &key, &value);
     assert_eq!(
         digest_of(&pairs[2].output),
@@ -150,10 +150,10 @@ fn leaf_hash_changes_with_key_and_value() {
     let perm = default_perm();
     let k1 = limbs_to_field(&bytes_to_limbs(&[1; 32]));
     let k2 = limbs_to_field(&bytes_to_limbs(&[2; 32]));
-    let v1 = pack_value_32(&[0; 32]);
+    let v1 = value_field_limbs(&Value32::new([0; 32]));
     let mut vb = [0u8; 32];
     vb[31] = 1;
-    let v2 = pack_value_32(&vb);
+    let v2 = value_field_limbs(&Value32::new(vb));
     assert_ne!(
         leaf_hash_with(&perm, &k1, &v1),
         leaf_hash_with(&perm, &k2, &v1)
@@ -197,8 +197,14 @@ fn structure_matches_reference_hasher_digests_differ() {
 
     for _round in 0..6 {
         let n = 1 + (rng.random::<u32>() % 40) as usize;
-        let batch_p: Vec<(Key, Vec<u8>)> = (0..n)
-            .map(|_| (rand_key(&mut rng), vec![rng.random::<u8>(); 4]))
+        let batch_p: Vec<(Key, Value32)> = (0..n)
+            .map(|_| {
+                (rand_key(&mut rng), {
+                    let mut b = [0u8; 32];
+                    rng.fill(b.as_mut_slice());
+                    Value32::new(b)
+                })
+            })
             .collect();
         let batch_s = batch_p.clone();
 
@@ -218,5 +224,38 @@ fn structure_matches_reference_hasher_digests_differ() {
                 .expect("poseidon2 verify");
         }
         old_p = new_p;
+    }
+}
+
+/// R3/M1 differential property test tying together the three representations:
+/// external 32-byte `Value32`/`Key32`, the internal MSB-first limbs, and the
+/// Poseidon2 leaf hash. Confirms the high-level `Hasher::hash_leaf` (which packs
+/// bytes→limbs internally) agrees with the low-level `leaf_hash_with` on
+/// independently packed limbs, and that byte↔limb is a round trip.
+#[test]
+fn byte_limb_poseidon_leaf_differential() {
+    use rsmt_core::{Hasher, Key32, limbs_to_bytes};
+    let perm = default_perm();
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xD1FF);
+    for _ in 0..2000 {
+        let mut kb = [0u8; 32];
+        let mut vb = [0u8; 32];
+        rng.fill(kb.as_mut_slice());
+        rng.fill(vb.as_mut_slice());
+        let key = Key32::new(kb);
+        let value = Value32::new(vb);
+
+        // byte→limb→byte round trip (both key and value pack identically).
+        assert_eq!(limbs_to_bytes(&key.limbs()), kb);
+        assert_eq!(limbs_to_bytes(&value.limbs()), vb);
+
+        // limb-level hash == byte-level Hasher::hash_leaf.
+        let low = leaf_hash_with(
+            &perm,
+            &limbs_to_field(&key.limbs()),
+            &value_field_limbs(&value),
+        );
+        let high = <Poseidon2Hasher as Hasher>::hash_leaf(&key.limbs(), &value);
+        assert_eq!(low, high, "limb-path and byte-path leaf hashes diverge");
     }
 }

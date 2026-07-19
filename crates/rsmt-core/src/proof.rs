@@ -6,7 +6,7 @@
 //! on.
 
 use crate::hasher::Hasher;
-use crate::limbs::{KEY_BITS, Key, is_canonical_region, key_bit, region_limbs};
+use crate::limbs::{KEY_BITS, Key, Value32, is_canonical_region, key_bit, region_limbs};
 
 /// A post-order consistency-proof opcode (D7 — exactly the rsmt6a.py set).
 ///
@@ -25,7 +25,7 @@ pub enum Op<D> {
         c_r: D,
     },
     /// Preserved leaf, opened: `(key, value)`.
-    OL { key: Key, value: Vec<u8> },
+    OL { key: Key, value: Value32 },
     /// New leaf; `(key, value)` is consumed from the sorted batch.
     L,
     /// Junction over the two preceding stack entries at bifurcation `depth`.
@@ -78,15 +78,24 @@ type Entry<D> = (Option<D>, D, Advice);
 /// `(old_root, new_root)` from `batch` under the coherence + confinement +
 /// four-way rules.
 ///
-/// `batch` is `(key_limbs, value)` pairs; it is sorted internally and required
-/// to have strictly increasing keys (D: sortedness/distinctness is the
-/// prover's convenience, but the verifier still rejects a batch that is not a
-/// valid ordering, matching rsmt6a.py).
+/// `batch` is `(key_limbs, value)` pairs with exact 32-byte values; it is sorted
+/// internally and required to have strictly increasing keys (D: sortedness /
+/// distinctness is the prover's convenience, but the verifier still rejects a
+/// batch that is not a valid ordering, matching rsmt6a.py).
+///
+/// **Existential-batch semantics (R3, `docs/r3/02-relation-and-extraction.md`).**
+/// This CPU verifier takes the batch explicitly, but the R3 *public statement*
+/// does not: the STARK proves only "there exists a canonical batch producing this
+/// `(old_root, new_root)` transition." By Lemma B
+/// (`docs/r3/03-rsmt-append-only.md`) the batch is exactly the strictly-increasing
+/// key subsequence of the `L` opcodes, forced by post-order topology + coherence —
+/// so R3 extracts it rather than trusting an external sorted list. The internal
+/// `sort` below is convenience, never trusted verifier preprocessing.
 pub fn verify_consistency<H: Hasher>(
     proof: &[Op<H::Digest>],
     old_root: Option<&H::Digest>,
     new_root: &H::Digest,
-    batch: &[(Key, Vec<u8>)],
+    batch: &[(Key, Value32)],
 ) -> Result<(), VerifyError> {
     if batch.is_empty() {
         // D6: the empty-batch identity transition is the caller's job; the
@@ -99,7 +108,7 @@ pub fn verify_consistency<H: Hasher>(
     }
 
     // Strictly increasing keys (rejects duplicates and unsorted input).
-    let mut sorted: Vec<&(Key, Vec<u8>)> = batch.iter().collect();
+    let mut sorted: Vec<&(Key, Value32)> = batch.iter().collect();
     sorted.sort_by_key(|a| a.0);
     for w in sorted.windows(2) {
         if w[0].0 >= w[1].0 {

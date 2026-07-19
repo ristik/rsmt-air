@@ -97,11 +97,11 @@ def scenario(out, name, seed, rounds):
         batch = []
         for _ in range(n):
             k = rng.getrandbits(256)
-            v = b"v%d" % rng.getrandbits(24)
+            v = rng.getrandbits(256).to_bytes(32, "big")  # exact 32-byte Value32 (R3-D1)
             batch.append((k, v))
         # occasionally re-record a possibly-present key (dedup path)
         if rng.random() < 0.3 and batch:
-            batch.append((batch[0][0], b"dup"))
+            batch.append((batch[0][0], (b"dup").ljust(32, b"\x00")))
         emit_round(out, tree, batch)
     out.append("ENDSCENARIO")
 
@@ -117,7 +117,7 @@ def scenario_shared_prefix(out, name, seed, rounds):
         batch = []
         for _ in range(n):
             k = base | rng.getrandbits(40)  # differ only in low 40 bits
-            v = b"w%d" % rng.getrandbits(16)
+            v = rng.getrandbits(256).to_bytes(32, "big")  # exact 32-byte Value32 (R3-D1)
             batch.append((k, v))
         emit_round(out, tree, batch)
     out.append("ENDSCENARIO")

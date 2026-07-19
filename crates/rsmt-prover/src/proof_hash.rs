@@ -55,6 +55,40 @@ pub type Poseidon2Pcs = TwoAdicFriPcs<F, Dft, Poseidon2ValMmcs, Poseidon2Challen
 pub type Poseidon2Challenger = DuplexChallenger<F, Perm24, 24, 16>;
 pub type Poseidon2Config = StarkConfig<Poseidon2Pcs, EF, Poseidon2Challenger>;
 
+/// The **fixed** R3 Poseidon2 STARK config: no caller `seed`, no
+/// `ProverConfig` (R3-D4, `DEVPLAN-R3.md` §6.4). The width-16/24 permutation
+/// constants derive deterministically from the protocol-constant seed
+/// [`R3_POSEIDON2_CONST_SEED`], and the FRI parameters are the frozen
+/// [`R3_FRI`]. Any change to either bumps the [`ProtocolId`] tag, so a prover
+/// cannot select a hash suite, seed, or FRI configuration. This is the seedless
+/// building block the M7 `prove_round`/`verify_round` will use.
+///
+/// [`R3_POSEIDON2_CONST_SEED`]: rsmt_protocol::R3_POSEIDON2_CONST_SEED
+/// [`R3_FRI`]: rsmt_protocol::R3_FRI
+/// [`ProtocolId`]: rsmt_protocol::ProtocolId
+pub fn r3_fixed_poseidon2_config() -> Poseidon2Config {
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(rsmt_protocol::R3_POSEIDON2_CONST_SEED);
+    let perm16 = Perm16::new_from_rng_128(&mut rng);
+    let perm24 = Perm24::new_from_rng_128(&mut rng);
+    let sponge = Poseidon2Sponge::new(perm24.clone());
+    let compress = Poseidon2Compress::new(perm16);
+    let val_mmcs = Poseidon2ValMmcs::new(sponge, compress, 3);
+    let challenge_mmcs = Poseidon2ChallengeMmcs::new(val_mmcs.clone());
+    let fri = rsmt_protocol::R3_FRI;
+    let fri_params = p3_fri::FriParameters {
+        log_blowup: fri.log_blowup,
+        log_final_poly_len: fri.log_final_poly_len,
+        max_log_arity: fri.max_log_arity,
+        num_queries: fri.num_queries,
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: fri.query_pow_bits,
+        mmcs: challenge_mmcs,
+    };
+    let pcs = Poseidon2Pcs::new(Dft::default(), val_mmcs, fri_params);
+    let challenger = Poseidon2Challenger::new(perm24);
+    Poseidon2Config::new(pcs, challenger)
+}
+
 impl ProvingHashSuite for Poseidon2ProofHash {
     type Config = Poseidon2Config;
 

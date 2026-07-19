@@ -34,8 +34,114 @@ pub const WIDE_LIMBS: usize = 8;
 /// A 256-bit key or region as 9 MSB-first BabyBear-sized limbs (D2/D3).
 pub type Key = [u32; LIMBS];
 
-/// A `(key, value)` batch/leaf pair.
-pub type KeyValue = (Key, Vec<u8>);
+/// A `(key, value)` batch/leaf pair. The value is **exactly** 32 bytes
+/// (`Value32`) — there is no length field and no implicit truncation/padding
+/// (R3-D1, finding §4: `pack_value_32` aliasing).
+pub type KeyValue = (Key, Value32);
+
+/// Canonical external 32-byte key (R3-D1). Byte order is big-endian / MSB-first
+/// (D1): byte 0 is the most-significant key byte. [`Key32::limbs`] is the
+/// injective packing into the internal 9-limb representation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Key32([u8; KEY_BYTES]);
+
+impl Key32 {
+    /// Wrap 32 bytes verbatim.
+    pub const fn new(bytes: [u8; KEY_BYTES]) -> Self {
+        Key32(bytes)
+    }
+
+    /// Checked exact-width conversion: `Some` iff `s.len() == 32`. Rejects both
+    /// short and long inputs — no truncation, no implicit padding.
+    pub fn from_slice(s: &[u8]) -> Option<Self> {
+        (s.len() == KEY_BYTES).then(|| {
+            let mut b = [0u8; KEY_BYTES];
+            b.copy_from_slice(s);
+            Key32(b)
+        })
+    }
+
+    /// The 32 canonical bytes.
+    pub const fn as_bytes(&self) -> &[u8; KEY_BYTES] {
+        &self.0
+    }
+
+    /// Injective packing into the internal MSB-first limb representation.
+    pub fn limbs(&self) -> Key {
+        bytes_to_limbs(&self.0)
+    }
+
+    /// Recover the byte key from canonical limbs.
+    pub fn from_limbs(limbs: &Key) -> Self {
+        Key32(limbs_to_bytes(limbs))
+    }
+}
+
+/// Opaque canonical 256-bit leaf value (R3-D1). The RSMT layer does not
+/// interpret it; applications hash their payload to a `Value32` with their own
+/// domain separation (see `docs/r3/01-security-model.md` §5). It is exactly 32
+/// bytes so byte→field packing is injective and every leaf is exactly three
+/// Poseidon2 permutations.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Value32([u8; KEY_BYTES]);
+
+impl Value32 {
+    /// Wrap 32 bytes verbatim.
+    pub const fn new(bytes: [u8; KEY_BYTES]) -> Self {
+        Value32(bytes)
+    }
+
+    /// Checked exact-width conversion: `Some` iff `s.len() == 32`. This is the
+    /// injective replacement for the deleted `pack_value_32(&[u8])`, which
+    /// truncated after 32 bytes and right-aligned shorter values (finding §4).
+    pub fn from_slice(s: &[u8]) -> Option<Self> {
+        (s.len() == KEY_BYTES).then(|| {
+            let mut b = [0u8; KEY_BYTES];
+            b.copy_from_slice(s);
+            Value32(b)
+        })
+    }
+
+    /// The 32 canonical bytes.
+    pub const fn as_bytes(&self) -> &[u8; KEY_BYTES] {
+        &self.0
+    }
+
+    /// Injective packing into 9 MSB-first limbs (identical to key packing).
+    pub fn limbs(&self) -> Key {
+        bytes_to_limbs(&self.0)
+    }
+}
+
+/// A checked absolute depth in `[0, 256]`. Constructing one rejects the
+/// out-of-range depths the reference verifier would reject as `BadDepth`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Depth(u16);
+
+impl Depth {
+    /// `Some` iff `d <= 256` (a leaf sits at `KEY_BITS = 256`).
+    pub const fn new(d: u16) -> Option<Self> {
+        if d <= KEY_BITS { Some(Depth(d)) } else { None }
+    }
+
+    /// The raw depth.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Construct a `Key` from raw limbs, rejecting any limb wider than its fixed
+/// width (`30,…,30,16` bits). This is the only checked path for building limbs
+/// that did not come from [`bytes_to_limbs`]; it closes the "field-limb preimage
+/// that is not a byte-encoded key" gap at the reference layer.
+pub fn key_from_limbs_checked(limbs: Key) -> Option<Key> {
+    for (j, l) in limbs.iter().enumerate() {
+        if *l >= (1u32 << limb_width(j)) {
+            return None;
+        }
+    }
+    Some(limbs)
+}
 
 const _: () = assert!(
     (WIDE_LIMBS as u16) * WIDE_LIMB_BITS + LAST_LIMB_BITS == KEY_BITS,

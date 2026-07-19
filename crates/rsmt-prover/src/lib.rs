@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod proof_hash;
+pub mod r3round;
 pub mod round;
 #[cfg(test)]
 mod tamper;

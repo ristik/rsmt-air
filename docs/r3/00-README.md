@@ -16,6 +16,7 @@ RSMT relation so they survive the arithmetization change.
 | [`03-rsmt-append-only.md`](03-rsmt-append-only.md) | The RSMT-level theorem (coherent additions ⇒ append-only tree semantics) and the **new-leaf ordering lemma** that lets R3 drop the batch table. | M0-④ |
 | [`04-soundness-budget.md`](04-soundness-budget.md) | The R3-D13 combined STARK/FRI + LogUp + Fiat–Shamir calculation, the derived **maximum shape**, and the **per-bus no-wrap** formulas. | M0-⑤, M0-⑥ |
 | [`05-baseline.md`](05-baseline.md) | Captured pre-R3 benchmarks, golden roots/streams, and the note marking the combined `prove_and_verify_round` API experimental. | M0-⑦, M0-⑧, M0-⑨ |
+| [`06-influence-manifest.md`](06-influence-manifest.md) | Per-column influence classification for `A/B/L/J/O/R/P` and the S1–S12 → code + test map (the M8 audit artifact). | M8 |
 
 **Status of the underlying implementation.** The starting point is the completed
 seven-table build `A/B/C/D/R/F/P` (commit `rsmt6a 1st cut (insecure)`), which

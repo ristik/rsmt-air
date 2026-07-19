@@ -14,15 +14,19 @@
 mod cols;
 pub mod dispatch;
 pub mod table_a;
+pub mod table_ar;
 pub mod table_b;
 pub mod table_c;
 pub mod table_d;
 pub mod table_e;
 pub mod table_f;
+pub mod table_j;
+pub mod table_l;
+pub mod table_o;
 pub mod table_p;
 pub mod table_r;
 
-pub use dispatch::RsmtAir;
+pub use dispatch::{R3Air, RsmtAir};
 pub use table_a::{NUM_PUBLIC, TABLE_A_PREP_WIDTH, TABLE_A_WIDTH, TableAAir};
 pub use table_b::{P2_VECTOR_LEN, TableBAir};
 pub use table_c::{TABLE_C_PREP_WIDTH, TABLE_C_WIDTH, TableCAir};

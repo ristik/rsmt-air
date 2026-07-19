@@ -9,14 +9,14 @@ use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
 use crate::hasher::Hasher;
-use crate::limbs::{Key, KeyValue, first_divergence, key_bit, region_limbs};
+use crate::limbs::{Key, KeyValue, Value32, first_divergence, key_bit, region_limbs};
 use crate::proof::Op;
 
 /// A tree node. Junctions carry their absolute depth and left-aligned region.
 pub enum Node<H: Hasher> {
     Leaf {
         key: Key,
-        value: Vec<u8>,
+        value: Value32,
         hash: H::Digest,
     },
     Junction {
@@ -35,7 +35,7 @@ impl<H: Hasher> Node<H> {
         }
     }
 
-    fn new_leaf(key: Key, value: Vec<u8>) -> Box<Self> {
+    fn new_leaf(key: Key, value: Value32) -> Box<Self> {
         let hash = H::hash_leaf(&key, &value);
         Box::new(Node::Leaf { key, value, hash })
     }
@@ -56,7 +56,7 @@ impl<H: Hasher> Node<H> {
 /// case). Emitted as `OL` when the build reaches it.
 struct FrozenLeaf<D> {
     key: Key,
-    value: Vec<u8>,
+    value: Value32,
     hash: D,
 }
 
@@ -118,7 +118,7 @@ impl<H: Hasher> Tree<H> {
     pub fn batch_insert(&mut self, batch: Vec<KeyValue>) -> (Vec<KeyValue>, Vec<Op<H::Digest>>) {
         // Keep the first occurrence of each new, not-yet-present key; BTreeMap
         // keys sort MSB-first (== integer order).
-        let mut new_items: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+        let mut new_items: BTreeMap<Key, Value32> = BTreeMap::new();
         for (key, value) in batch {
             if new_items.contains_key(&key) || self.find_leaf(&key).is_some() {
                 continue;
@@ -129,7 +129,7 @@ impl<H: Hasher> Tree<H> {
             return (Vec::new(), Vec::new());
         }
 
-        let items: Vec<(Key, Vec<u8>)> = new_items.into_iter().collect();
+        let items: Vec<(Key, Value32)> = new_items.into_iter().collect();
         let mut proof = Vec::new();
         let root = std::mem::take(&mut self.root);
         let new_root = insert::<H>(root, &items, 0, items.len(), false, &mut proof);
@@ -163,7 +163,7 @@ fn emit_preserved<H: Hasher>(node: &Node<H>, parent_new: bool, out: &mut Vec<Op<
     match node {
         Node::Leaf { key, value, .. } => out.push(Op::OL {
             key: *key,
-            value: value.clone(),
+            value: *value,
         }),
         Node::Junction {
             depth,
@@ -183,7 +183,7 @@ fn emit_preserved<H: Hasher>(node: &Node<H>, parent_new: bool, out: &mut Vec<Op<
 /// Build a fresh subtree over sorted `items[lo..hi]`; every junction is new.
 /// `frozen`, if present, is a pre-existing leaf being merged (emitted `OL`).
 fn build<H: Hasher>(
-    items: &[(Key, Vec<u8>)],
+    items: &[(Key, Value32)],
     lo: usize,
     hi: usize,
     frozen: Option<&FrozenLeaf<H::Digest>>,
@@ -196,16 +196,16 @@ fn build<H: Hasher>(
         {
             out.push(Op::OL {
                 key: f.key,
-                value: f.value.clone(),
+                value: f.value,
             });
             return Box::new(Node::Leaf {
                 key: f.key,
-                value: f.value.clone(),
+                value: f.value,
                 hash: f.hash.clone(),
             });
         }
         out.push(Op::L);
-        return Node::new_leaf(*k, v.clone());
+        return Node::new_leaf(*k, *v);
     }
 
     let split = first_divergence(&items[lo].0, &items[hi - 1].0);
@@ -219,7 +219,7 @@ fn build<H: Hasher>(
 
 fn insert<H: Hasher>(
     node: Option<Box<Node<H>>>,
-    items: &[(Key, Vec<u8>)],
+    items: &[(Key, Value32)],
     lo: usize,
     hi: usize,
     parent_new: bool,
@@ -238,12 +238,8 @@ fn insert<H: Hasher>(
     match *node {
         Node::Leaf { key, value, hash } => {
             // Keys are pre-filtered distinct from `key`: merge and rebuild.
-            let frozen = FrozenLeaf {
-                key,
-                value: value.clone(),
-                hash,
-            };
-            let mut merged: Vec<(Key, Vec<u8>)> = items[lo..hi].to_vec();
+            let frozen = FrozenLeaf { key, value, hash };
+            let mut merged: Vec<(Key, Value32)> = items[lo..hi].to_vec();
             merged.push((key, value));
             merged.sort_by_key(|a| a.0);
             let len = merged.len();
@@ -289,7 +285,7 @@ fn insert<H: Hasher>(
 fn split_edge<H: Hasher>(
     node: Box<Node<H>>,
     node_region: Key,
-    items: &[(Key, Vec<u8>)],
+    items: &[(Key, Value32)],
     lo: usize,
     hi: usize,
     d_div: u16,

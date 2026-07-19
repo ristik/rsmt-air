@@ -9,6 +9,9 @@
 
 pub mod plan;
 pub mod r10;
+pub mod r3arena;
+pub mod r3build;
+pub mod r3plan;
 
 pub use plan::{
     ARow, Arena, CLeaf, ChildCoh, DRow, FJoin, FOpen, LeafKind, OpKind, PlanError, Publics, Shape,

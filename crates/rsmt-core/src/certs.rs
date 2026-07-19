@@ -6,7 +6,7 @@
 //! region from the queried key itself (`region_limbs(key, d)`).
 
 use crate::hasher::Hasher;
-use crate::limbs::{Key, key_bit, region_limbs};
+use crate::limbs::{Key, Value32, key_bit, region_limbs};
 use crate::tree::{Node, Tree};
 
 /// Root-to-leaf inclusion certificate: junction depths and the sibling digest
@@ -30,7 +30,7 @@ pub enum ChainItem<D> {
     },
     Leaf {
         key: Key,
-        value: Vec<u8>,
+        value: Value32,
     },
 }
 
@@ -85,7 +85,7 @@ impl<H: Hasher> Tree<H> {
                 Node::Leaf { key: k, value, .. } => {
                     chain.push(ChainItem::Leaf {
                         key: *k,
-                        value: value.clone(),
+                        value: *value,
                     });
                     return if k != key { Some(chain) } else { None };
                 }
@@ -121,7 +121,7 @@ pub fn verify_inclusion<H: Hasher>(
     cert: &InclusionCert<H::Digest>,
     root_hash: &H::Digest,
     key: &Key,
-    value: &[u8],
+    value: &Value32,
 ) -> bool {
     if cert.depths.len() != cert.siblings.len() {
         return false;

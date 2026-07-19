@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use rsmt_core::{Key, KeyValue, Op, Tree, bytes_to_limbs};
+use rsmt_core::{Key, KeyValue, Op, Tree, Value32, bytes_to_limbs};
 use rsmt_hash::{Digest, Poseidon2Hasher};
 
 use crate::*;
@@ -29,7 +29,13 @@ fn drive(seed: u64, rounds: usize, sizes: &[usize]) -> (usize, usize, usize, usi
     for r in 0..rounds {
         let n = sizes[r % sizes.len()];
         let batch: Vec<KeyValue> = (0..n)
-            .map(|_| (rand_key(&mut rng), vec![rng.random::<u8>(); 8]))
+            .map(|_| {
+                (rand_key(&mut rng), {
+                    let mut vb = [0u8; 32];
+                    rng.fill(vb.as_mut_slice());
+                    Value32::new(vb)
+                })
+            })
             .collect();
         let (applied, proof) = tree.batch_insert(batch);
         let new_root = tree.root_hash();
@@ -72,13 +78,13 @@ fn permutation_budget_and_prefix_sharing() {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
     let b1: Vec<KeyValue> = (0..128)
-        .map(|_| (rand_key(&mut rng), vec![1u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([1u8; 32])))
         .collect();
     let (a1, _) = tree.batch_insert(b1);
     let r1 = tree.root_hash().unwrap();
 
     let b2: Vec<KeyValue> = (0..64)
-        .map(|_| (rand_key(&mut rng), vec![2u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([2u8; 32])))
         .collect();
     let (a2, p2) = tree.batch_insert(b2);
     let r2 = tree.root_hash().unwrap();
@@ -109,7 +115,7 @@ fn self_validation_refuses_tampered_stream() {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(11);
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
     let batch: Vec<KeyValue> = (0..32)
-        .map(|_| (rand_key(&mut rng), vec![9u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([9u8; 32])))
         .collect();
     let (applied, proof) = tree.batch_insert(batch);
     let root = tree.root_hash().unwrap();
@@ -144,7 +150,7 @@ fn determinism() {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(3);
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
     let batch: Vec<KeyValue> = (0..48)
-        .map(|_| (rand_key(&mut rng), vec![5u8; 8]))
+        .map(|_| (rand_key(&mut rng), Value32::new([5u8; 32])))
         .collect();
     let (applied, proof) = tree.batch_insert(batch);
     let root = tree.root_hash().unwrap();
@@ -167,7 +173,7 @@ proptest! {
         for _ in 0..3 {
             let n = 1 + (rng.random::<u32>() % 40) as usize;
             let batch: Vec<KeyValue> =
-                (0..n).map(|_| (rand_key(&mut rng), vec![rng.random::<u8>(); 8])).collect();
+                (0..n).map(|_| (rand_key(&mut rng), { let mut vb = [0u8; 32]; rng.fill(vb.as_mut_slice()); Value32::new(vb) })).collect();
             let (applied, proof) = tree.batch_insert(batch);
             let nr = tree.root_hash();
             if applied.is_empty() { continue; }
