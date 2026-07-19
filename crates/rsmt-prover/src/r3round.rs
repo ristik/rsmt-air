@@ -169,6 +169,86 @@ where
     verify_batch(&config, &airs_v, &proof, &pv, &prover_data.common).map_err(|e| format!("{e:?}"))
 }
 
+/// Per-table sizing for one R3 round (cells = padded height × (main + prep)).
+#[derive(Debug, Clone)]
+pub struct R3TableCells {
+    pub name: &'static str,
+    pub real: usize,
+    pub padded: usize,
+    pub main: usize,
+    pub prep: usize,
+}
+
+impl R3TableCells {
+    pub fn cells(&self) -> usize {
+        self.padded * (self.main + self.prep)
+    }
+}
+
+/// The per-table cost breakdown of an R3 round (widths are layout constants;
+/// heights derive from the plan). No proving — pure sizing for the cost model.
+pub fn r3_round_cells(plan: &R3Plan) -> Vec<R3TableCells> {
+    use rsmt_air::table_ar::{TABLE_AR_PREP_WIDTH, TABLE_AR_WIDTH};
+    use rsmt_air::table_j::{TABLE_J_PREP_WIDTH, TABLE_J_WIDTH};
+    use rsmt_air::table_l::{TABLE_L_PREP_WIDTH, TABLE_L_WIDTH};
+    use rsmt_air::table_o::{TABLE_O_PREP_WIDTH, TABLE_O_WIDTH};
+
+    let pad = |n: usize| n.next_power_of_two().max(2);
+    let s = &plan.shape;
+    let b_rows = (s.n_p2ff + s.n_p2term).div_ceil(8);
+    vec![
+        R3TableCells {
+            name: "A",
+            real: s.n_ops,
+            padded: pad(s.n_ops),
+            main: TABLE_AR_WIDTH,
+            prep: TABLE_AR_PREP_WIDTH,
+        },
+        R3TableCells {
+            name: "B",
+            real: b_rows,
+            padded: pad(b_rows),
+            main: 2384,
+            prep: 16,
+        },
+        R3TableCells {
+            name: "L",
+            real: s.n_leaf,
+            padded: pad(s.n_leaf),
+            main: TABLE_L_WIDTH,
+            prep: TABLE_L_PREP_WIDTH,
+        },
+        R3TableCells {
+            name: "J",
+            real: s.n_join,
+            padded: pad(s.n_join),
+            main: TABLE_J_WIDTH,
+            prep: TABLE_J_PREP_WIDTH,
+        },
+        R3TableCells {
+            name: "O",
+            real: s.n_open,
+            padded: pad(s.n_open),
+            main: TABLE_O_WIDTH,
+            prep: TABLE_O_PREP_WIDTH,
+        },
+        R3TableCells {
+            name: "R",
+            real: 2047,
+            padded: 2048,
+            main: 1,
+            prep: 3,
+        },
+        R3TableCells {
+            name: "P",
+            real: 31,
+            padded: 32,
+            main: 1,
+            prep: 3,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tamper;
 #[cfg(test)]
