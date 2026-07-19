@@ -19,8 +19,8 @@ impl ProtocolId {
     /// informational.
     pub const fn tag(self) -> [u8; 8] {
         match self {
-            // ASCII "R3P2v001" — version-stamped.
-            ProtocolId::R3Poseidon2 => *b"R3P2v001",
+            // ASCII "R3P2v002" — v002 = M10 no-grinding FRI (116 queries, 0 PoW).
+            ProtocolId::R3Poseidon2 => *b"R3P2v002",
         }
     }
 
@@ -46,12 +46,14 @@ pub struct FriConfig {
     pub log_final_poly_len: usize,
 }
 
-/// The frozen FRI parameters (`04-soundness-budget.md`): 116-bit conjectured
-/// standalone, ≥100-bit total at the frozen max shape.
+/// The frozen FRI parameters (`04-soundness-budget.md`, `09-m10-fri-grid.md`):
+/// 116-bit conjectured standalone, ≥100-bit total at the frozen max shape. M10
+/// selected the **no-grinding** candidate — 116 queries, 0 PoW — which proves
+/// faster than the old `100 queries + 16 PoW` and is recursion-friendly.
 pub const R3_FRI: FriConfig = FriConfig {
     log_blowup: 1,
-    num_queries: 100,
-    query_pow_bits: 16,
+    num_queries: 116,
+    query_pow_bits: 0,
     max_log_arity: 3,
     log_final_poly_len: 0,
 };

@@ -19,6 +19,7 @@ RSMT relation so they survive the arithmetization change.
 | [`06-influence-manifest.md`](06-influence-manifest.md) | Per-column influence classification for `A/B/L/J/O/R/P` and the S1–S12 → code + test map (the M8 audit artifact). | M8 |
 | [`07-r3-cost.md`](07-r3-cost.md) | Measured R3 per-table cell cost vs the pre-R3 baseline (validates the §5.1 layout projections). | M8/M11 |
 | [`08-m9-logup-pairing.md`](08-m9-logup-pairing.md) | The M9 gate result: two-entry global LogUp pairing is unsupported in the pinned Plonky3 (kept unpaired). | M9 |
+| [`09-m10-fri-grid.md`](09-m10-fri-grid.md) | The M10 FRI parameter grid and the chosen no-grinding production configuration. | M10 |
 
 **Status of the underlying implementation.** The starting point is the completed
 seven-table build `A/B/C/D/R/F/P` (commit `rsmt6a 1st cut (insecure)`), which

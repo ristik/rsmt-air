@@ -102,6 +102,65 @@ fn cross_process_verify_from_bytes() {
     );
 }
 
+/// M10 FRI parameter grid: prove/verify/proof-size for the R3 round under
+/// several FRI configurations that all meet the ~116-bit conjectured target,
+/// including the §6.4-preferred **no-grinding** candidates. Run with
+/// `--nocapture` (release) to read the numbers.
+#[test]
+fn m10_fri_grid() {
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+    let mut tree: Tree<Poseidon2Hasher> = Tree::new();
+    tree.batch_insert(
+        (0..1024)
+            .map(|_| (rand_key(&mut rng), Value32::new([1u8; 32])))
+            .collect(),
+    );
+    let old = tree.root_hash();
+    let batch: Vec<KeyValue> = (0..64)
+        .map(|_| (rand_key(&mut rng), Value32::new([2u8; 32])))
+        .collect();
+    let (applied, proof_ops) = tree.batch_insert(batch);
+    let new = tree.root_hash().unwrap();
+    let plan = build_r3_plan(&proof_ops, &applied, old.as_ref(), &new).unwrap();
+
+    // (log_blowup, num_queries, query_pow_bits) — conjectured bits = lb·q + pow.
+    let grid = [
+        (1usize, 100usize, 16usize), // current (baseline)
+        (1, 116, 0),                 // §6.4 no-grinding candidate
+        (1, 132, 0),                 // no-grind, extra margin
+        (2, 58, 0),                  // higher blowup, no-grind (smaller proof)
+    ];
+    eprintln!("M10 FRI grid (prefill=1024 batch=64):");
+    eprintln!("  lb  q  pow  bits  prove_ms verify_ms proof_KB");
+    for (lb, q, pow) in grid {
+        let cfg = ProverConfig {
+            log_blowup: lb,
+            num_queries: q,
+            query_proof_of_work_bits: pow,
+            ..ProverConfig::default()
+        };
+        let bits = lb * q + pow;
+        let t0 = std::time::Instant::now();
+        let proof = prove_r3_round::<Poseidon2ProofHash>(&plan, 42, &cfg);
+        let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let bytes = bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+        let old_root = plan.old_root.unwrap_or([F::ZERO; 8]);
+        let publics =
+            rsmt_air::table_ar::public_values(&old_root, &plan.new_root, plan.old_root_is_none);
+        let t1 = std::time::Instant::now();
+        verify_r3_round::<Poseidon2ProofHash>(42, &cfg, &plan.shape, &publics, &proof)
+            .expect("verify");
+        let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "  {lb:>2} {q:>3} {pow:>3} {bits:>5} {prove_ms:>9.1} {verify_ms:>9.1} {:>8.1}",
+            bytes.len() as f64 / 1024.0
+        );
+    }
+}
+
+use crate::proof_hash::F;
+use p3_field::PrimeCharacteristicRing as _;
+
 /// Print the per-table cost breakdown + prove/verify timing for the M0 baseline
 /// scenario (prefill 1024, batch 64). Run with `--nocapture` to read the numbers.
 #[test]
