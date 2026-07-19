@@ -21,8 +21,8 @@ use rsmt_core::{Key, KeyValue, Tree, Value32, bytes_to_limbs, verify_consistency
 use rsmt_hash::Poseidon2Hasher;
 use rsmt_prover::config::ProverConfig;
 use rsmt_prover::proof_hash::{Blake3ProofHash, Poseidon2ProofHash, ProvingHash, Sha256ProofHash};
-use rsmt_prover::round::{RoundMetrics, prove_and_verify_round_metrics};
-use rsmt_witness::{TracePlan, build_plan};
+use rsmt_prover::{prove_r3_round, r3_round_cells, verify_r3_round};
+use rsmt_witness::r3build::{R3Plan, build_r3_plan};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "RSMT v6a arithmetization benchmarks")]
@@ -130,9 +130,16 @@ fn rand_key(rng: &mut Xoshiro256PlusPlus) -> Key {
     bytes_to_limbs(&bytes)
 }
 
-/// Build a self-validated round plan: prefill a tree, then apply `batch` fresh
-/// leaves and record the consistency proof. Returns the plan and its build time.
-fn build_round_plan(seed: u64, prefill: usize, batch: usize) -> (TracePlan, Duration) {
+/// One measured R3 round: per-table cells + phase timings + proof size.
+struct R3Metrics {
+    cells: Vec<rsmt_prover::R3TableCells>,
+    prove_time: Duration,
+    verify_time: Duration,
+    proof_bytes: usize,
+}
+
+/// Build a self-validated R3 round plan. Returns the plan and its build time.
+fn build_round_plan(seed: u64, prefill: usize, batch: usize) -> (R3Plan, Duration) {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut tree: Tree<Poseidon2Hasher> = Tree::new();
     if prefill > 0 {
@@ -149,55 +156,87 @@ fn build_round_plan(seed: u64, prefill: usize, batch: usize) -> (TracePlan, Dura
     let new = tree.root_hash().expect("non-empty after batch");
 
     let t = Instant::now();
-    let plan = build_plan(&proof, &applied, old.as_ref(), &new).expect("build_plan");
+    let plan = build_r3_plan(&proof, &applied, old.as_ref(), &new).expect("build_r3_plan");
     (plan, t.elapsed())
 }
 
-/// Dispatch the measured round to the requested proving-hash suite.
-fn measure(plan: &TracePlan, seed: u64, cfg: &ProverConfig, hash: ProvingHash) -> RoundMetrics {
-    let r = match hash {
-        ProvingHash::Poseidon2 => {
-            prove_and_verify_round_metrics::<Poseidon2ProofHash>(plan, seed, cfg)
-        }
-        ProvingHash::Sha256 => prove_and_verify_round_metrics::<Sha256ProofHash>(plan, seed, cfg),
-        ProvingHash::Blake3 => prove_and_verify_round_metrics::<Blake3ProofHash>(plan, seed, cfg),
+/// Prove + verify one R3 round with the requested proving-hash suite, timing
+/// each phase and serializing the proof for its byte size.
+fn measure(plan: &R3Plan, seed: u64, cfg: &ProverConfig, hash: ProvingHash) -> R3Metrics {
+    macro_rules! run {
+        ($h:ty) => {{
+            let t0 = Instant::now();
+            let proof = prove_r3_round::<$h>(plan, seed, cfg);
+            let prove_time = t0.elapsed();
+            let bytes = bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+            let old_root = plan.old_root.unwrap_or_default();
+            let publics =
+                rsmt_air::table_ar::public_values(&old_root, &plan.new_root, plan.old_root_is_none);
+            let t1 = Instant::now();
+            verify_r3_round::<$h>(seed, cfg, &plan.shape, &publics, &proof).expect("verify");
+            (prove_time, t1.elapsed(), bytes.len())
+        }};
+    }
+    let (prove_time, verify_time, proof_bytes) = match hash {
+        ProvingHash::Poseidon2 => run!(Poseidon2ProofHash),
+        ProvingHash::Sha256 => run!(Sha256ProofHash),
+        ProvingHash::Blake3 => run!(Blake3ProofHash),
     };
-    r.expect("prove+verify")
+    R3Metrics {
+        cells: r3_round_cells(plan),
+        prove_time,
+        verify_time,
+        proof_bytes,
+    }
 }
 
-fn print_tables(m: &RoundMetrics) {
+impl R3Metrics {
+    fn total_cells(&self) -> usize {
+        self.cells.iter().map(|t| t.cells()).sum()
+    }
+    fn max_main_width(&self) -> usize {
+        self.cells.iter().map(|t| t.main).max().unwrap_or(0)
+    }
+    fn b_perms(&self) -> usize {
+        self.cells
+            .iter()
+            .find(|t| t.name == "B")
+            .map_or(0, |t| t.real)
+    }
+}
+
+fn print_tables(m: &R3Metrics) {
     println!(
         "  {:>2} {:>8} {:>8} {:>6} {:>5} {:>12}",
         "T", "real", "padded", "main", "prep", "cells"
     );
-    for t in &m.tables {
+    let mut total = 0usize;
+    let mut max_main = 0usize;
+    for t in &m.cells {
+        total += t.cells();
+        max_main = max_main.max(t.main);
         println!(
             "  {:>2} {:>8} {:>8} {:>6} {:>5} {:>12}",
             t.name,
-            t.real_rows,
-            t.padded_height,
-            t.main_width,
-            t.prep_width,
+            t.real,
+            t.padded,
+            t.main,
+            t.prep,
             t.cells(),
         );
     }
     println!(
-        "  total cells={} max_main_width={} proof={:.1} KB",
-        m.total_cells(),
-        m.max_main_width(),
+        "  total cells={total} max_main_width={max_main} proof={:.1} KB",
         m.proof_bytes as f64 / 1024.0,
     );
-    println!(
-        "  trace={:?} prove={:?} verify={:?}",
-        m.trace_time, m.prove_time, m.verify_time
-    );
+    println!("  prove={:?} verify={:?}", m.prove_time, m.verify_time);
 }
 
 fn run_round(batch: usize, prefill: usize, seed: u64, cfg: &ProverConfig, hash: HashArg) {
     let (plan, wit) = build_round_plan(seed, prefill, batch);
     println!(
-        "round: prefill={prefill} batch={batch} (L={} N={} O={} S={}) witness={wit:?}",
-        plan.shape.n_l, plan.shape.n_join, plan.shape.n_open, plan.shape.n_s,
+        "round: prefill={prefill} batch={batch} (ops={} L={} N={} O={}) witness={wit:?}",
+        plan.shape.n_ops, plan.shape.n_leaf, plan.shape.n_join, plan.shape.n_open,
     );
     for &h in hash.suites() {
         println!("proof_hash={}", h.name());
@@ -236,13 +275,14 @@ fn run_perf(batches: &str, prefill: usize, seed: u64, cfg: &ProverConfig, hash: 
         );
         for &b in &sizes {
             let (plan, wit) = build_round_plan(seed, prefill, b);
+            let (n_l, n_join) = (plan.shape.n_leaf, plan.shape.n_join);
             let m = measure(&plan, seed, cfg, h);
             println!(
                 "{:>6} {:>7} {:>7} {:>9} {:>13} {:>6} {:>7} {:>9} {:>10} {:>9.1}",
                 b,
-                m.n_l,
-                m.n_join,
-                m.b_real_perms,
+                n_l,
+                n_join,
+                m.b_perms(),
                 m.total_cells(),
                 m.max_main_width(),
                 wit.as_millis(),

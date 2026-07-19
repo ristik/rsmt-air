@@ -319,10 +319,10 @@ impl<F: p3_field::Field> p3_lookup::LookupAir<F> for TableJAir {
         use p3_air::symbolic::{BaseLeaf, SymbolicAirBuilder, SymbolicExpression};
         use p3_lookup::{Direction, Kind};
 
-        use crate::table_a::BUS_TREE_NAME;
+        use crate::table_ar::BUS_TREE_NAME;
         use crate::table_b::{BUS_P2FF_NAME, BUS_P2TERM_NAME};
-        use crate::table_f::BUS_POW2_NAME;
         use crate::table_o::BUS_PARENT_NAME;
+        use crate::table_p::BUS_POW2_NAME;
         use crate::table_r::BUS_RANGE_NAME;
 
         type SE<F> = SymbolicExpression<F>;

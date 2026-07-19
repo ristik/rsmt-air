@@ -18,6 +18,7 @@ rsmt-witness.workspace = true
 rsmt-air.workspace = true
 rsmt-prover.workspace = true
 clap.workspace = true
+bincode.workspace = true
 rand.workspace = true
 rand_xoshiro.workspace = true
 tracing.workspace = true

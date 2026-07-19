@@ -166,7 +166,7 @@ impl<F: p3_field::Field> p3_lookup::LookupAir<F> for TableOAir {
         let exponent = w_q - SE::<F>::from(ml[o_roff]) - SE::<F>::from(F::ONE);
         lookups.push(p3_lookup::LookupAir::register_lookup(
             self,
-            Kind::Global(crate::table_f::BUS_POW2_NAME.to_string()),
+            Kind::Global(crate::table_p::BUS_POW2_NAME.to_string()),
             &[(
                 vec![exponent, SE::<F>::from(ml[o_powb])],
                 is_real.clone(),

@@ -1,25 +1,24 @@
-//! Prover wiring around `p3-batch-stark` for the RSMT v6a AIRs (DEVPLAN M4).
+//! Prover wiring around `p3-batch-stark` for the R3 RSMT AIRs.
 //!
-//! `prove_and_verify_round` proves all seven table AIRs for one round through
-//! the real FRI stack and verifies the result. The FRI/transcript proof hash is
-//! selectable (`proof_hash`), independent of the in-circuit Poseidon2.
+//! [`r3round::prove_r3_round`] proves the seven R3 tables (`A/B/L/J/O/R/P`) for
+//! one round through the real FRI stack; [`r3round::verify_r3_round`] verifies
+//! it from only the proof, the public inputs, and the scalar shape — rebuilding
+//! the AIRs and preprocessing itself (verifier-independent). The FRI/transcript
+//! proof hash is selectable (`proof_hash`), independent of the in-circuit
+//! Poseidon2.
 
 pub mod config;
-#[cfg(test)]
-mod logup_pairing;
 pub mod proof_hash;
 pub mod r3round;
-pub mod round;
+
 #[cfg(test)]
-mod tamper;
+mod logup_pairing;
 
 pub use config::ProverConfig;
 pub use proof_hash::{
     Blake3ProofHash, Poseidon2ProofHash, ProvingHash, ProvingHashSuite, Sha256ProofHash,
 };
-pub use round::{
-    RoundMetrics, RoundShape, TableMetric, prove_and_verify_round, prove_and_verify_round_metrics,
+pub use r3round::{
+    R3RoundTraces, R3TableCells, prove_and_verify_r3_round, prove_and_verify_r3_round_with,
+    prove_r3_round, r3_round_cells, round_shape, verify_r3_round,
 };
-
-#[cfg(test)]
-mod tests;

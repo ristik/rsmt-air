@@ -25,6 +25,9 @@ use rsmt_witness::r3build::R3ARow;
 
 use crate::cols::{cast, width_of};
 
+/// Bus 1 (tree): A sends each non-last real row; J receives it as a child.
+pub const BUS_TREE_NAME: &str = "tree";
+
 /// Main columns (33).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -172,7 +175,7 @@ impl<F: p3_field::Field> p3_lookup::LookupAir<F> for TableArAir {
         }
         lookups.push(p3_lookup::LookupAir::register_lookup(
             self,
-            Kind::Global(crate::table_a::BUS_TREE_NAME.to_string()),
+            Kind::Global(crate::table_ar::BUS_TREE_NAME.to_string()),
             &[(tree, is_real - is_last, Direction::Send)],
         ));
         lookups

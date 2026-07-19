@@ -19,6 +19,31 @@ Here it is treated as the given spec; the AIR's job is to prove that it
 
 ---
 
+> ## ⚠️ R3 status — read this first
+>
+> The production arithmetization is now the **R3** seven-table set
+> **`A/B/L/J/O/R/P`** (reduced A, Poseidon2 B, fused-leaf L, join J, opening O,
+> range R, powers P). The M11 cut-over **removed** the legacy `A/C/D/E/F` tables
+> and the old prover harness. **The detailed table sections below
+> (Table A/F/C, the LogUp-bus table, the cost projection) describe the
+> *superseded* pre-R3 design and are kept as background only.**
+>
+> The **authoritative R3 specification** lives in [`docs/r3/`](docs/r3/):
+> security model, the exact relation + extraction, the append-only theorem and
+> new-leaf ordering lemma, the soundness budget, the per-column influence
+> manifest with the S1–S12→code map, the measured cost vs baseline, and the
+> M9/M10 optimization results. What R3 adds over the old design: byte-faithful
+> `Value32` leaves (S4), range-checked canonical opened regions (S5), an
+> occurrence-correct permutation arena (completeness), a verifier-independent
+> reduced A, a canonical protocol/decoder (`rsmt-protocol`), and a no-grinding
+> FRI configuration — all proven end-to-end and adversarially validated.
+>
+> Prove/verify a round via
+> `rsmt_prover::{prove_r3_round, verify_r3_round}`; the verifier reconstructs its
+> own preprocessing from the public shape (no prover data crosses the boundary).
+
+---
+
 ## Background: the statement being arithmetized
 
 ### The tree
