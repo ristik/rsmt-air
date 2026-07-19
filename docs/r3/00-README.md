@@ -18,6 +18,7 @@ RSMT relation so they survive the arithmetization change.
 | [`05-baseline.md`](05-baseline.md) | Captured pre-R3 benchmarks, golden roots/streams, and the note marking the combined `prove_and_verify_round` API experimental. | M0-⑦, M0-⑧, M0-⑨ |
 | [`06-influence-manifest.md`](06-influence-manifest.md) | Per-column influence classification for `A/B/L/J/O/R/P` and the S1–S12 → code + test map (the M8 audit artifact). | M8 |
 | [`07-r3-cost.md`](07-r3-cost.md) | Measured R3 per-table cell cost vs the pre-R3 baseline (validates the §5.1 layout projections). | M8/M11 |
+| [`08-m9-logup-pairing.md`](08-m9-logup-pairing.md) | The M9 gate result: two-entry global LogUp pairing is unsupported in the pinned Plonky3 (kept unpaired). | M9 |
 
 **Status of the underlying implementation.** The starting point is the completed
 seven-table build `A/B/C/D/R/F/P` (commit `rsmt6a 1st cut (insecure)`), which

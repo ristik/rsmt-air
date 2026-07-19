@@ -5,6 +5,8 @@
 //! selectable (`proof_hash`), independent of the in-circuit Poseidon2.
 
 pub mod config;
+#[cfg(test)]
+mod logup_pairing;
 pub mod proof_hash;
 pub mod r3round;
 pub mod round;
