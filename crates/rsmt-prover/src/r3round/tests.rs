@@ -125,10 +125,10 @@ fn m10_fri_grid() {
 
     // (log_blowup, num_queries, query_pow_bits) — conjectured bits = lb·q + pow.
     let grid = [
-        (1usize, 100usize, 16usize), // current (baseline)
-        (1, 116, 0),                 // §6.4 no-grinding candidate
-        (1, 132, 0),                 // no-grind, extra margin
-        (2, 58, 0),                  // higher blowup, no-grind (smaller proof)
+        (1usize, 100usize, 16usize), // old baseline (has grinding)
+        (1, 116, 0),                 // no-grind, blowup 1
+        (2, 58, 0),                  // blowup 2, no-grind, 116 bits
+        (2, 64, 0),                  // blowup 2, no-grind, 128 bits (clean)
     ];
     eprintln!("M10 FRI grid (prefill=1024 batch=64):");
     eprintln!("  lb  q  pow  bits  prove_ms verify_ms proof_KB");

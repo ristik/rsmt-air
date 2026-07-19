@@ -19,8 +19,10 @@ impl ProtocolId {
     /// informational.
     pub const fn tag(self) -> [u8; 8] {
         match self {
-            // ASCII "R3P2v002" — v002 = M10 no-grinding FRI (116 queries, 0 PoW).
-            ProtocolId::R3Poseidon2 => *b"R3P2v002",
+            // ASCII "R3P2v003" — v003 = M10 balanced FRI (blowup 2, 64 queries,
+            // 0 PoW): 128 bits, no grinding, small proof + few queries for
+            // recursion friendliness.
+            ProtocolId::R3Poseidon2 => *b"R3P2v003",
         }
     }
 
@@ -46,13 +48,16 @@ pub struct FriConfig {
     pub log_final_poly_len: usize,
 }
 
-/// The frozen FRI parameters (`04-soundness-budget.md`, `09-m10-fri-grid.md`):
-/// 116-bit conjectured standalone, ≥100-bit total at the frozen max shape. M10
-/// selected the **no-grinding** candidate — 116 queries, 0 PoW — which proves
-/// faster than the old `100 queries + 16 PoW` and is recursion-friendly.
+/// The frozen FRI parameters (`04-soundness-budget.md`, `09-m10-fri-grid.md`).
+/// M10 balanced the four axes — security bits, proof size, proving time, and
+/// recursion friendliness — rather than proving time alone. The winner is
+/// **`log_blowup = 2` (rate ¼), 64 queries, no grinding**: 128 conjectured bits,
+/// no in-circuit PoW loop, and only 64 query openings (half the recursive-
+/// verifier work of a rate-½ config) at a ~33 % smaller proof and faster verify.
+/// The one cost is prover time (rate ¼ doubles the LDE), a one-time expense.
 pub const R3_FRI: FriConfig = FriConfig {
-    log_blowup: 1,
-    num_queries: 116,
+    log_blowup: 2,
+    num_queries: 64,
     query_pow_bits: 0,
     max_log_arity: 3,
     log_final_poly_len: 0,

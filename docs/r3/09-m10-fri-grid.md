@@ -12,36 +12,50 @@ preference for a **no-grinding** candidate over `100 queries + 16 PoW bits`.
 
 | log_blowup | queries | PoW | bits | prove ms | verify ms | proof KB |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 100 | 16 | 116 | 131.7 | 88.0 | 1997 |
-| **1** | **116** | **0** | **116** | **116.8** | 98.9 | 2303 |
-| 1 | 132 | 0 | 132 | 118.6 | 114.0 | 2609 |
-| 2 | 58 | 0 | 116 | 176.4 | 61.8 | 1218 |
+| 1 | 100 | 16 | 116 | 128 | 87 | 1997 |
+| 1 | 116 | 0 | 116 | 119 | 99 | 2303 |
+| 2 | 58 | 0 | 116 | 179 | 65 | 1218 |
+| **2** | **64** | **0** | **128** | 180 | 67 | 1335 |
 
-## Reading
+## The four axes — proving time is not the only goal
 
-- **Grinding is a net loss here.** The current `(1,100,16)` spends ~15 ms grinding
-  16 PoW bits; the no-grinding `(1,116,0)` reaches the same 116 conjectured bits
-  and proves **faster** (116.8 vs 131.7 ms). Grinding is also awkward inside a
-  recursive verifier (§6.4), so it earns nothing.
-- **Higher blowup trades prove time for proof size + verify time.** `(2,58,0)`
-  gives the smallest proof (1218 KB, −39 %) and fastest verify (61.8 ms) but the
-  slowest prove (176 ms, +34 %) because the LDE doubles.
+A production choice must balance **security bits, proof size, proving time, and
+recursion friendliness**, ideally with simple parameters. Reading the grid:
+
+- **Grinding is pure loss.** `(1,100,16)` spends ~15 ms on a 16-bit PoW grind;
+  dropping it (`1,116,0`) reaches the same 116 bits and proves faster. Grinding
+  is also a serial hash loop that is very expensive to re-verify **inside a
+  recursive verifier**, so it earns nothing on any axis.
+- **Rate ¼ (`log_blowup=2`) is the recursion win.** It halves the query count
+  (58–64 vs 116) for the same bits. Each FRI query is a Merkle-path opening the
+  recursive verifier must check in-circuit, so **fewer queries → a materially
+  smaller recursive verifier**. Rate ¼ also gives the **smallest proof**
+  (~1.2–1.3 MB, −33 %) and the **fastest verify** (~65 ms). Its cost is prover
+  time (+~40 %, the doubled LDE) — a one-time prover expense, not paid by the
+  many downstream/recursive verifiers.
 
 ## Decision
 
-Adopt **`(log_blowup=1, num_queries=116, query_pow_bits=0)`** as the production
-`R3_FRI`:
+Adopt **`(log_blowup = 2, num_queries = 64, query_pow_bits = 0)`** as the
+production `R3_FRI`:
 
-- **fastest prove** of any candidate, and faster than the pre-M10 baseline;
-- **no grinding** — the §6.4 preference, and recursion-friendly;
-- meets the 116-bit standalone target (`04-soundness-budget.md`).
+- **128 conjectured bits** — a clean power-of-two query count with comfortable
+  margin over the 116-bit target (`04-soundness-budget.md`);
+- **no grinding** — nothing to re-run in a recursive verifier;
+- **64 query openings** — half the in-circuit Merkle work of a rate-½ config;
+- **~1.3 MB proof, ~67 ms verify** — smallest/fastest tier;
+- **simple**: rate ¼, 64 queries, no PoW.
 
-`(2,58,0)` remains the documented alternative if a deployment prioritizes proof
-size / verify time / recursion depth over prover throughput; switching to it is a
-one-line `R3_FRI` change plus a protocol-tag bump.
+The prover pays ~40 % more time (the rate-¼ LDE); this is the deliberate trade —
+proving is one-time, whereas proof size, verify time, query count, and
+grinding-freedom all directly help every downstream and recursive verifier.
+
+`(1,116,0)` remains the documented alternative when **prover throughput** is the
+priority (fastest prove, but 2.3 MB proof and 116 queries). Switching is a
+one-line `R3_FRI` change plus a tag bump.
 
 Per the plan, changing the FRI parameters is a protocol change: `R3_FRI` is
-updated in `rsmt-protocol` and the `ProtocolId` tag is bumped `R3P2v001 →
-R3P2v002`. The S-box/vector-length sweep and warmed-median measurements on a
-pinned machine remain future work (they do not change soundness — Table B
-dominates and the arithmetization is already baseline-speed).
+`rsmt-protocol`-owned and the `ProtocolId` tag is bumped to `R3P2v003`. The
+S-box-register / vector-length sweep (compile-time `table_b` constants) and
+warmed-median measurements on a pinned machine remain future work; they do not
+change soundness — Table B dominates and the arithmetization is baseline-speed.
