@@ -47,6 +47,61 @@ fn prefilled_round_proves_and_verifies() {
     prove_round(2, 64, 16).expect("prefilled round");
 }
 
+/// Cross-process verification (M7 exit criterion): prove in "process 1",
+/// serialize the proof to bytes, then verify in "process 2" that receives ONLY
+/// the bytes, the public inputs, and the scalar shape — no plan, no `ProverData`.
+#[test]
+fn cross_process_verify_from_bytes() {
+    use p3_batch_stark::BatchProof;
+    use p3_field::PrimeCharacteristicRing;
+    use rsmt_air::table_ar;
+
+    use crate::proof_hash::{F, Poseidon2Config};
+
+    // -- process 1 (prover) --
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+    let mut tree: Tree<Poseidon2Hasher> = Tree::new();
+    tree.batch_insert(
+        (0..48)
+            .map(|_| (rand_key(&mut rng), Value32::new([1u8; 32])))
+            .collect(),
+    );
+    let old = tree.root_hash();
+    let batch: Vec<KeyValue> = (0..16)
+        .map(|_| (rand_key(&mut rng), Value32::new([2u8; 32])))
+        .collect();
+    let (applied, proof_ops) = tree.batch_insert(batch);
+    let new = tree.root_hash().unwrap();
+    let plan = build_r3_plan(&proof_ops, &applied, old.as_ref(), &new).unwrap();
+
+    let proof = prove_r3_round::<Poseidon2ProofHash>(&plan, 42, &ProverConfig::default());
+    let shape = plan.shape;
+    let old_root = plan.old_root.unwrap_or([F::ZERO; 8]);
+    let publics = table_ar::public_values(&old_root, &plan.new_root, plan.old_root_is_none);
+    let bytes = bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+
+    // -- process 2 (verifier): only bytes + shape + publics + fixed protocol seed --
+    let (proof2, _): (BatchProof<Poseidon2Config>, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    verify_r3_round::<Poseidon2ProofHash>(42, &ProverConfig::default(), &shape, &publics, &proof2)
+        .expect("cross-process verify");
+
+    // Negative: a tampered public root must fail.
+    let mut bad_publics = publics.clone();
+    bad_publics[8] += F::ONE; // first limb of new_root
+    assert!(
+        verify_r3_round::<Poseidon2ProofHash>(
+            42,
+            &ProverConfig::default(),
+            &shape,
+            &bad_publics,
+            &proof2
+        )
+        .is_err(),
+        "wrong public root must be rejected"
+    );
+}
+
 /// Print the per-table cost breakdown + prove/verify timing for the M0 baseline
 /// scenario (prefill 1024, batch 64). Run with `--nocapture` to read the numbers.
 #[test]
