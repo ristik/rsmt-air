@@ -11,7 +11,9 @@ use p3_air::symbolic::SymbolicExpressionExt;
 use p3_batch_stark::{BatchProof, ProverData, StarkInstance, prove_batch, verify_batch};
 use p3_commit::PolynomialSpace;
 use p3_field::Algebra;
+use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
+use p3_uni_stark::StarkGenericConfig;
 
 use rsmt_air::table_ar::TableArAir;
 use rsmt_air::table_j::TableJAir;
@@ -58,10 +60,11 @@ pub struct R3RoundTraces<'a> {
 
 /// Prove all seven R3 tables for a round and verify the proof (single process).
 ///
-/// **EXPERIMENTAL** like the legacy harness: it uses the seed-based proving
-/// config; the verifier-owned `prepare_*`/`prove_round`/`verify_round` split is
-/// the remaining M7 work. What it *does* establish is that the R3 arithmetization
-/// balances across all seven buses.
+/// The verify step reconstructs its preprocessing (`CommonData`) from AIRs built
+/// **from the shape alone** — it never consumes the prover's `ProverData` (S10,
+/// M7). The remaining non-verifier-owned input is the seed-based proving config
+/// (fixed by `r3_fixed_poseidon2_config` / removed in M10) and the cross-process
+/// serialization boundary.
 pub fn prove_and_verify_r3_round<H: ProvingHashSuite>(
     plan: &R3Plan,
     seed: u64,
@@ -165,8 +168,32 @@ where
     let instances = StarkInstance::new_multiple(&airs, &traces_refs, &pv, &prover_data.common);
     let proof = prove_batch(&config, &instances, &prover_data);
 
-    let airs_v = make_airs();
-    verify_batch(&config, &airs_v, &proof, &pv, &prover_data.common).map_err(|e| format!("{e:?}"))
+    // -- Verifier-owned preprocessing (M7, S10) --
+    // The verifier reconstructs `CommonData` (the preprocessing commitment +
+    // lookup definitions) from AIRs it builds *from the shape alone*, plus the
+    // padded heights — it never touches the prover's traces or `ProverData`.
+    // `CommonData` is a deterministic function of `(config, airs, heights)`, so
+    // the reconstruction equals the prover's and the proof still verifies.
+    let is_zk = config.is_zk();
+    let heights = [
+        a.height(),
+        b.height(),
+        l.height(),
+        j.height(),
+        o.height(),
+        r.height(),
+        p.height(),
+    ];
+    // Heights are powers of two, so log2 = trailing_zeros.
+    let degree_bits: Vec<usize> = heights
+        .iter()
+        .map(|&h| h.trailing_zeros() as usize + is_zk)
+        .collect();
+    let mut airs_v = make_airs();
+    let verifier_common =
+        ProverData::from_airs_and_degrees(&config, &mut airs_v, &degree_bits).common;
+
+    verify_batch(&config, &airs_v, &proof, &pv, &verifier_common).map_err(|e| format!("{e:?}"))
 }
 
 /// Per-table sizing for one R3 round (cells = padded height × (main + prep)).
