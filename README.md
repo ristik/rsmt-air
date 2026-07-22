@@ -1,7 +1,7 @@
 # rsmt-air
 
-Plonky3 AIRs that **arithmetize the consistency-proof verification
-algorithm** of the RSMT sparse Merkle tree -- the trusted data structure
+Plonky3 AIRs arithmetization of the consistency-proof verification
+algorithm of the RSMT sparse Merkle tree -- the trusted data structure
 behind the Unicity Aggregator. A single STARK binds two public 8-limb
 BabyBear digests, `old_root` and `new_root`, certifying that a batch of
 insertions was applied correctly between them. The batch and the
@@ -21,16 +21,16 @@ Here it is treated as the given spec; the AIR's job is to prove that it
 
 > ## R3 pipeline — orientation
 >
-> The production arithmetization is the **R3** seven-table set **`A/B/L/J/O/R/P`**
+> The production arithmetization is the R3 (revision 3) seven-table set **`A/B/L/J/O/R/P`**
 > (reduced A, Poseidon2 B, fused-leaf L, join J, opening O, range R, powers P),
 > described in the sections below. It replaced a pre-R3 `A/B/C/D/R/F/P` build; the
-> R3 improvements are byte-faithful `Value32` leaves (S4), range-checked canonical
-> opened regions (S5), an occurrence-correct permutation arena (completeness), a
+> R3 improvements are canonically encoded `Value32` leaves (S4), range-checked canonical
+> opened regions (S5), an occurrence-correct permutation table (completeness), a
 > verifier-independent reduced A, a canonical protocol/decoder (`rsmt-protocol`),
-> and a balanced no-grinding FRI configuration — all proven end-to-end and
-> adversarially validated.
+> and a balanced, with adequate security level FRI configuration, and adversariall
+> validation.
 >
-> The **authoritative deep specification** lives in [`docs/r3/`](docs/r3/):
+> The **authoritative specification** is provided in [`docs/r3/`](docs/r3/):
 > security model, the exact relation + extraction, the append-only theorem and
 > new-leaf ordering lemma, the soundness budget, the per-column influence manifest
 > with the S1–S12→code map, the measured cost vs baseline, and the M9/M10
@@ -269,7 +269,7 @@ flowchart LR
     A ==>|"boundary: last row"| Root
 ```
 
-The batch and proof stay private — they live only in committed traces. The
+The batch and proof stay private — they exist only in committed traces. The
 **verifier reconstructs every AIR and its preprocessing from the public shape
 alone** (scalar row counts), never consuming a prover object, then checks local
 constraints, the public roots, and every LogUp balance
@@ -422,7 +422,7 @@ the *new* junction `N(d₁)`, so it is **opened**; `a` stays under the
 *pre-existing* `N(d₂)` and remains an opaque `S`.
 
 ```mermaid
-flowchart TB
+flowchart LR
     classDef u fill:#eef,stroke:#447,color:#113
     classDef n fill:#cfc,stroke:#393,color:#131
     classDef c fill:#ffe,stroke:#a90,color:#331
@@ -433,6 +433,7 @@ flowchart TB
         O2 --> OA["Leaf a · h_a"]:::u
         O2 --> OB["Leaf b · h_b"]:::u
     end
+
     subgraph NEW["post-state · new_root"]
         direction TB
         M2["N(d₂,p₂)"]:::c
@@ -441,6 +442,8 @@ flowchart TB
         M1 --> MB["Leaf b · h_b<br/>(Oₗ — opened)"]:::u
         M1 --> MC["Leaf c [new]"]:::n
     end
+
+    OLD ~~~ NEW
 ```
 
 Stack-machine trace (advice shown; `p₁ = k_b[0..d₁) = k_c[0..d₁)`,
@@ -632,7 +635,7 @@ every local constraint family:
   digest at the boundary; the empty-batch identity transition is handled
   by the caller, not this AIR.
 - **Zero-knowledge.** The default FRI config is succinct but not zk:
-  private inputs live in unmasked committed traces. For zk, use
+  private inputs can be found in unmasked committed traces. For zk, use
   `FriParameters::new_benchmark_zk` with masking columns -- out of scope
   (the goal is verifier work reduction, not input privacy).
 
@@ -653,11 +656,11 @@ batch size (the `rsmt-bench perf` sweep confirms this).
 
 ---
 
-## Parameter choice — balancing four axes
+## Parameter choice
 
-Proving time is **not** the only goal: a production configuration balances
+Proving time is not the only goal: a production configuration balances
 **security bits, proof size, proving time, and recursion friendliness**, with
-simple parameters. The M10 FRI grid ([`docs/r3/09`](docs/r3/09-m10-fri-grid.md))
+parameters. The M10 FRI grid ([`docs/r3/09`](docs/r3/09-m10-fri-grid.md))
 settled on **`log_blowup = 2` (rate ¼), 64 queries, no grinding** — the frozen
 `R3_FRI`:
 
