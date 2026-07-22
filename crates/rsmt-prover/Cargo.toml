@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 rsmt-core.workspace = true
 rsmt-hash.workspace = true
+rsmt-protocol.workspace = true
 rsmt-witness.workspace = true
 rsmt-air.workspace = true
 p3-air.workspace = true

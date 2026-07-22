@@ -1,1023 +1,715 @@
 # rsmt-air
 
-Plonky3 AIRs that prove correctness of a batch of insertions into the
-RSMT3 sparse Merkle tree. (ie, the Unicity Oracle of the Aggregator machine)
-The proof binds two public 8-element BabyBear digests
--- `old_root` and `new_root`; certifying that the state transition from old
-to new root was executed correctly. The batch of new leaves and the
-consistency proof itself are private inputs, and not needed for verification.
+Plonky3 AIRs arithmetization of the consistency-proof verification
+algorithm of the RSMT sparse Merkle tree -- the trusted data structure
+behind the Unicity Aggregator. A single STARK binds two public 8-limb
+BabyBear digests, `old_root` and `new_root`, certifying that a batch of
+insertions was applied correctly between them. The batch and the
+consistency-proof stream are **private** inputs; the verifier accepts on
+the public roots alone.
 
-For an in-depth specification see [`rsmt-air.md`](rsmt-air.md).
-
----
-
-## The tree being proven
-
-RSMT3 is a path-compressed Patricia trie over 256-bit keys (sentinel-encoded
-as `BigUint`). There are three kinds of nodes:
-
-- **Leaf** -- `(key, value)`, hashed by an additive Poseidon2 sponge.
-- **Junction (`N`)** -- internal bifurcation at some depth `d`, with two
-  children. Hashed as `Poseidon2(left[8] || right[8])` after adding
-  `DOMAIN_NODE` into limb 0 and the bifurcation depth into limb 1.
-  This is one Poseidon2 permutation only; no sponge.
-- **Empty subtree** -- a missing branch, denoted by the digest `None`.
-
-Keys are inserted in pre-sorted order. A *consistency proof* is a flat
-**post-order opcode stream** describing how to rebuild both the pre-state and
-post-state roots from the batch. There are three opcodes:
-
-| Op | Meaning | Stack effect |
-|---|---|---|
-| `S(h)` | unchanged subtree, digest `h` | push `(h, h)` |
-| `L` | new leaf -- pop next sorted batch element | push `(None, leaf_hash(k,v))` |
-| `N(d)` | junction at depth `d` -- pops two children | push `(node_hash(old_l, old_r, d), node_hash(new_l, new_r, d))` if both children existed before, else handles the four-way pass-through rule |
-
-Reference verification algorithm is expressed as a stack machine: walk
-the opcode stream, and at the end
-there must be exactly one entry in the stack, `(old_root, new_root)`.
-
-### Four-way old-state rule on `N`
-
-A junction's *new* child digests always exist (every leaf is fresh). Its
-*old* child digests may not -- one or both children may have been empty. Let
-`b00, b01, b10, b11` be the indicators of the four cases:
-
-| `b00` | `b01` | `b10` | `b11` | parent's old-state |
-|---|---|---|---|---|
-| 1 | 0 | 0 | 0 | `None` |
-| 0 | 1 | 0 | 0 | `right.old` (passthrough) |
-| 0 | 0 | 1 | 0 | `left.old` (passthrough) |
-| 0 | 0 | 0 | 1 | `node_hash(left.old, right.old, depth)` |
-
-This is the main rule of the consistency-proof verifier, for junctions in the stream,
-enforced by the AIR tables.
+The scope of this repository is the zk side: AIR table design, constraint
+completeness, lookup-bus soundness, and prover performance. The
+verification algorithm itself -- what it guarantees about the tree and why
+-- is specified and proven elsewhere: the aggregation-layer paper
+(Sections *Stack-Machine Verification* / *Formal Model* / *Security
+Theorem*) and the executable reference `ndsmt-experiments/rsmt6a.py`.
+Here it is treated as the given spec; the AIR's job is to prove that it
+*was executed*, on private inputs, with the public roots as its outcome.
 
 ---
 
-## From stack based verifier to AIR table generation
+> ## R3 pipeline — orientation
+>
+> The production arithmetization is the R3 (revision 3) seven-table set **`A/B/L/J/O/R/P`**
+> (reduced A, Poseidon2 B, fused-leaf L, join J, opening O, range R, powers P),
+> described in the sections below. It replaced a pre-R3 `A/B/C/D/R/F/P` build; the
+> R3 improvements are canonically encoded `Value32` leaves (S4), range-checked canonical
+> opened regions (S5), an occurrence-correct permutation table (completeness), a
+> verifier-independent reduced A, a canonical protocol/decoder (`rsmt-protocol`),
+> and a balanced, with adequate security level FRI configuration, and adversariall
+> validation.
+>
+> The **authoritative specification** is provided in [`docs/r3/`](docs/r3/):
+> security model, the exact relation + extraction, the append-only theorem and
+> new-leaf ordering lemma, the soundness budget, the per-column influence manifest
+> with the S1–S12→code map, the measured cost vs baseline, and the M9/M10
+> optimization results.
+>
+> Prove/verify a round via `rsmt_prover::{prove_r3_round, verify_r3_round}`; the
+> verifier reconstructs its own preprocessing from the public shape (no prover
+> data crosses the boundary).
 
-The AIR design can be approached through the data flow. The prover
-has two private inputs:
+---
 
-- the consistency proof, materialized as Table A ("proof table"), one row
-  per `S` / `L` / `N` opcode;
-- the sorted insertion batch, materialized as Table D.
+## Background: the statement being arithmetized
 
-The verifier sees only public values `(old_root, new_root)`. The purpose of
-the AIR is to prove that the private proof table and private batch flow
-through the hash and join constraints to produce the final real row of
-Table A, and that this final row is exactly the public root pair.
+### The tree
 
-### Table A (proof table)
+RSMT is a path-compressed Patricia trie over 256-bit keys. Three node
+kinds:
 
-Table A is the proof table. It contains the opcode stream in row order and
-records, for every row, the old-state digest, the new-state digest, and an
-`old_is_none` bit. Its preprocessed columns are `row_idx`, `is_real`, and
-`is_last_real`; its witness columns are:
+- **Leaf** `(key, value)` -- hashed by a 3-step additive Poseidon2 sponge.
+- **Junction `N`** -- an internal bifurcation at **depth `d`** with
+  **region `p`**: the `d`-bit key prefix addressing the node. Every key in
+  the subtree extends `p`; `p‖0` goes left, `p‖1` goes right. Hashed by a
+  2-permutation node sponge over `(DOMAIN_NODE, d, p, left, right)`.
+- **Empty subtree** -- a missing branch, digest `None`.
 
-- `is_s, is_l, is_n`: one-active opcode selector;
-- `old_hash[8], new_hash[8], old_is_none`: hash computation progress at this point;
-- `batch_idx`: meaningful only on `L` rows;
-- `depth, left_ptr, node_hash_old_needed`: meaningful only on `N` rows.
+A leaf's region is its full key; its depth is `κ = 256`. **Depth and
+region are absolute**: splitting an edge *above* a node changes neither, so
+inserting keys never re-hashes an existing node -- an insertion only mints
+new leaf and junction hashes. This immutability is what makes the
+consistency proof short.
 
-The three opcode types are processed by table A as follows:
+```mermaid
+flowchart TB
+    classDef j fill:#eef,stroke:#447,color:#113
+    classDef l fill:#efe,stroke:#393,color:#131
+    R["N  d=2  p=<b>10</b>"]:::j
+    R -->|"bit 2 = 0"| A["N  d=5  p=<b>100</b>…"]:::j
+    R -->|"bit 2 = 1"| B["Leaf  key=<b>101</b>…"]:::l
+    A -->|0| C["Leaf key=10010…"]:::l
+    A -->|1| D["Leaf key=10011…"]:::l
+```
 
-- `S(h)` is an unchanged subtree: `old_hash = new_hash = h` and
-  `old_is_none = 0`.
-- `L` is a fresh inserted leaf: `old_hash = 0`, `old_is_none = 1`, and
-  `new_hash` must be the leaf-sponge final digest for `batch_idx`.
-- `N(depth)` is a junction result: Table A stores only the parent tuple and
-  metadata. The child tuples, four-way old-state rule, and node hashes are
-  checked in Table F and linked back to this row.
+*Every node's region is a prefix of every key beneath it; each junction's
+region extends its parent's on the correct side.*
 
-Every non-last Table A row sends
-`(row_idx, old_hash, new_hash, old_is_none)` on the `tree` bus. Every
-junction consumes two such rows in Table F. The last real Table A row does
-not send on `tree`; it is the output row, and boundary constraints pin
-`(old_hash, new_hash)` to the public `(old_root, new_root)`.
+### The verification algorithm
 
-`left_ptr` is witness metadata that identifies the left child row for an
-`N`; the right child is constrained in Table F by
-`right_ptr = parent_row_idx - 1`. The current witness builder derives these
-pointers by walking the post-order proof, but that is only a helper for
-constructing rows. The AIR statement is the table/bus relation itself:
-every non-root proof row is consumed exactly once as a child, and the final
-proof row is the root.
+A consistency proof is a flat **post-order** opcode stream. The reference
+verifier walks it with a stack of triples `(old_digest, new_digest,
+advice)`, where `advice = (depth, region)` describes the top node of a
+stacked subtree (or `⊥` for an opaque one). At the end the stack must hold
+exactly one triple, `(old_root, new_root, ·)`.
+
+| Op | Meaning | Pops | Pushes |
+|---|---|---|---|
+| `S(h)` | opaque unchanged subtree | -- | `(h, h, ⊥)` |
+| `O(d,p,c_l,c_r)` | unchanged junction, opened one level | -- | `(h, h, (d,p))`, `h = nodehash(d,p,c_l,c_r)` |
+| `Oₗ(k,v)` | unchanged leaf, opened | -- | `(h, h, (κ,k))`, `h = leafhash(k,v)` |
+| `L` | new leaf, next from sorted batch | -- | `(None, leafhash(k,v), (κ,k))` |
+| `N(d)` | junction -- derive `p`, check coherence, join | 2 | `(old, new, (d,p))` |
+
+Two details matter for the arithmetization:
+
+- **`N` carries only the depth.** The region `p` is *derived* from the
+  advice of the two children on the stack -- regions never travel in the
+  proof stream.
+- **Openings (`O`, `Oₗ`) expose the advice of preserved subtrees.** An
+  opaque `S` has no advice and is only admissible under a *pre-existing*
+  junction; wherever a preserved subtree meets a *new* junction, the
+  prover must present its opened form.
+
+The `N(d)` handler combines three rule families:
+
+```mermaid
+flowchart TB
+    classDef box fill:#fff,stroke:#447,color:#113,text-align:left
+
+    N["N(d): pop right (o_r, n_r, a_r), pop left (o_l, n_l, a_l)"]:::box
+
+    subgraph COH["① edge coherence — placement"]
+        direction TB
+        C1["each advised child a_x=(δ,ρ):  δ > d  and  ρ[d] = side"]:::box
+        C2["derive p = ρ[0..d);  advised children must agree on p"]:::box
+        C3["at least one child advised  ⇒  p is defined"]:::box
+    end
+
+    subgraph CNF["② confinement — opaque subtrees"]
+        direction TB
+        F1["junction new (b11=0)  ⇒  BOTH children advised"]:::box
+        F2["⇒ opaque S never meets a new junction"]:::box
+    end
+
+    subgraph ALG["③ digest algebra — the four-way rule"]
+        direction TB
+        A1["new  = nodehash(d, p, n_l, n_r)   (always)"]:::box
+        A2["old  = None | passthrough | nodehash(d,p,o_l,o_r)"]:::box
+    end
+
+    N --> COH --> CNF --> ALG
+```
+
+**③ Four-way old-state rule.** The *new* child digests always exist; the
+*old* ones may be `None`. With `b00..b11` indicating which children
+existed:
+
+| `b00` | `b01` | `b10` | `b11` | `old` result | junction is |
+|:-:|:-:|:-:|:-:|---|---|
+| 1 | | | | `None` | new (empty→empty) |
+| | 1 | | | `right.old` (passthrough) | new |
+| | | 1 | | `left.old` (passthrough) | new |
+| | | | 1 | `nodehash(d, p, left.old, right.old)` | pre-existing |
+
+Only the `b11` case hashes on the old side; passthroughs keep add-only
+proofs short. A junction is **pre-existing iff `b11 = 1`** -- exactly the
+case where an opaque `S` child is admissible.
+
+**Why the coherence rules exist**, in one breath: digest algebra alone
+proves that hashes are preserved, but not that new leaves sit where their
+keys dictate -- and a misplaced junction lets a malicious operator shadow
+an existing key with a new value under a fresh certified root
+(cross-round equivocation, i.e. a double-spend enabler). Rules ①-② close
+this; the attack, the formal definitions, and the soundness theorems are
+provided in the paper ('Unicity Bluepaper') and are reproduced executably
+in `ndsmt-experiments/rsmt6a.py`. For this repository :all three rule
+families are part of the statement, and the constraints must cover every
+one of them.**
 
 ### Hashing
 
-All Poseidon2 permutations are checked by Table B. Other tables
-request full permutation tuples
-`(input[16], output[16])` through the `p2` bus, and Table B sends exactly
-the committed permutation lanes checked by `VectorizedPoseidon2Air`.
+**Leaf hash** -- 3-step additive Poseidon2 sponge, rate 8 / capacity 8,
+digest = `state[0..8]` after step 2. Keys and values pack as 9×30-bit
+BabyBear limbs (limbs 0..7 hold 30 bits, limb 8 holds 16).
 
-Leaf data to be hashed is longer than one permutation input, thus a
-sponge compression function is used; compression steps controlled by Table C.
-For each batch row it runs the following sponge absorption steps:
+```
+state ← [0;16]
+step 0:  state[0]+=DOMAIN_LEAF; state[1..8]+=key[0..7];        state←P2(state)
+step 1:  state[0]+=key[7]; state[1]+=key[8]; state[2..8]+=value[0..6]; state←P2(state)
+step 2:  state[0..3]+=value[6..9];                            state←P2(state)
+leaf_digest = state[0..8]
+```
 
-1. start from zero state, add `DOMAIN_LEAF` and `key[0..7]`, then run
-   Poseidon2 permutation;
-2. add `key[7..9]` and `value[0..6]`, then run Poseidon2 permutation;
-3. add `value[6..9]`, then run Poseidon2 permutation.
-
-Table C keeps the full 16-element sponge state for each step. The final digest
-is `state_out[0..8]` on step 2, sent to the matching `L` row in Table A on
-the `leaf_hash` bus. Table D supplies `(idx, key[9], value[9])` to Table C
-on the `batch` bus, so a Table A leaf row cannot use a digest that was not
-computed from the private batch.
-
-Internal tree node hashes are controlled by Table F. For each `N` row it receives the
-left and right child tuples from Table A, applies the four-way old-state
-rule, and requests Poseidon2 permutation from Table B:
-
-- `parent_new = H_node(left_new, right_new, depth)` is always requested;
-- `parent_old = H_node(left_old, right_old, depth)` is requested only when
-  both old children exist (`b11 = 1`);
-- pass-through cases do not request an old node hash.
-
-A node-hash input is `left[8] || right[8]` with `DOMAIN_NODE` added to
-element 0 and `depth` added to element 1. The digest is the first 8 output elements.
-Table F also stores the bottom 8 output elements (`parent_*_tail`) so the
-lookup tuple matches Table B's full 16-element output; otherwise only the
-truncated digest would be tied to Poseidon2.
-
-### Entire data flow
-
-The arrows below are LogUp multiset equalities:
+**Node hash** -- the preimage carries the region and does not fit one
+width-16 permutation, so it is a **2-permutation sponge**. The key design
+point: the first permutation depends only on the junction's *position*
+`(d, p)`, so it is **shared** between the old-side and new-side digests of
+the same junction.
 
 ```mermaid
 flowchart LR
-      D[("D: input batch")]
-      C[["C: leaf sponge<br/>3 rows per leaf"]]
-      A[["A: proof table<br/>one row per opcode"]]
-      F[["F: N-join<br/>children to parent"]]
-      B[("B: Poseidon2<br/>permutations")]
-      E[("E: u8 range")]
-      Root(["public roots<br/>old_root, new_root"]):::boundary
+    classDef p2 fill:#fce,stroke:#a37,color:#311
+    classDef in fill:#eef,stroke:#447,color:#113
+    classDef out fill:#efe,stroke:#393,color:#131
 
-      D -- "Bus 6: batch" --> C
-      C -- "Bus 4: leaf_hash" --> A
-      A -- "Bus 1: tree children" --> F
-      F -- "Bus 3: parent" --> A
-      E -- "Bus 5: depth byte" --> A
-      B -- "Bus 2: p2" --> C
-      B -- "Bus 2: p2" --> F
-      A -- "boundary: last real row" --> Root
+    POS["position block<br/>[DOMAIN_NODE, d, p[0..9], 0…]"]:::in
+    PRE(["P2  (prefix perm)"]):::p2
+    POS --> PRE
 
-      classDef boundary fill:#fde,stroke:#a33,stroke-width:2px;
-      classDef table fill:#eef,stroke:#447;
-      class A,C,F table;
+    PRE -->|"mid[16]"| KNEW["+ left_new[0..8]<br/>+ right_new[8..16]"]:::in
+    KNEW --> PNEW(["P2"]):::p2 --> DNEW["new digest<br/>= out[0..8]"]:::out
+
+    PRE -->|"mid[16] (same)"| KOLD["+ left_old[0..8]<br/>+ right_old[8..16]"]:::in
+    KOLD --> POLD(["P2"]):::p2 --> DOLD["old digest<br/>= out[0..8]  (only if b11)"]:::out
 ```
 
-We can see sort of data flow:
+Permutation budget per object:
 
-`D batch row -> C leaf digest -> A L row -> F junction rows -> A final row -> public roots`
+| object | permutations | note |
+|---|:-:|---|
+| leaf (`L` or `Oₗ`) | 3 | sponge steps |
+| new junction | 2 | prefix + one children block |
+| pre-existing junction (`b11`) | 3 | prefix **shared**, + two children blocks |
+| opening (`O`) | 2 | prefix + one children block |
 
+Region limbs reuse the key packing verbatim -- a leaf's advice region *is*
+its key limbs, so every region comparison operates on one uniform 9-limb
+representation. Regions are stored **left-aligned and zero-padded** below
+bit `d`: one canonical encoding per region.
 
-The batch and proof stay private because they appear only in committed
-traces. Verification reconstructs the AIR shapes and checks the proof,
-public values, global preprocessed commitment, local constraints, and
-LogUp balances.
+---
 
-### Constraints checking
+## From stack machine to AIR
 
-Table A constraints make each proof row well-formed:
+R3 arithmetizes the stack machine with **seven AIRs** sharing one
+`p3-batch-stark` commitment: `A / B / L / J / O / R / P`. Each opcode is one
+**Table A** row; four of the five are *backed* by a helper row that does the real
+work and hands back a digest (and advice) over a LogUp bus. The reference
+machine's *stack* never appears as a table — instead the advice tuple rides the
+tree/parent bus **alongside** the digest pair, so a junction sees its children's
+`(depth, region)` in exactly the place the stack machine would, and cannot pair
+one row's digest with another's advice because they travel as one tuple.
 
-- opcode selectors are boolean and one-active;
-- `S` rows are unchanged subtrees;
-- `L` rows are fresh leaves with canonical zero old hash;
-- `N` rows do not carry a batch index;
-- `old_is_none` implies `old_hash = 0`;
-- padding rows are zero;
-- the last 'real' (not padding) row equals the public roots;
-- buses fire only on the rows where the corresponding value is meaningful.
+There is **no batch table**. By the new-leaf ordering lemma
+([`docs/r3/03`](docs/r3/03-rsmt-append-only.md)) the `L`-opcode keys are already
+strictly increasing in A-row order — forced by post-order topology plus
+coherence — so the batch is the extracted `L` subsequence, not a trusted input.
 
-Table F constraints make each junction row well-formed:
+### Which table serves which opcode
 
-- left/right/parent none bits and case bits are boolean;
-- `b01`, `b10`, `b11`, and `parent_none` are fixed by the child none bits;
-- pass-through old-state cases copy the passing old-child digest;
-- full (with both children) old-state cases require an old node hash through Bus 2;
-- `right_ptr = parent_row_idx - 1` preserves the local post-order shape;
-- the parent tuple sent back to Table A includes `depth` and
-  `node_hash_old_needed`, so Table A's `N` row cannot detach from the
-  join rule that produced it.
+| opcode | Table A row | backed by |
+|---|---|---|
+| `S(h)` | `old = new = h`, no advice | — (self-contained) |
+| `O(d,p,c_l,c_r)` | `old = new = digest`, advice `(d, p)` | **O** (canonical opening) |
+| `Oₗ(k,v)` | `old = new = digest`, advice `(κ, k)` | **L** (opened leaf) |
+| `L` | `old = 0`, `old_is_none = 1`, `new = digest`, advice `(κ, k)` | **L** (new leaf) |
+| `N(d)` | parent tuple, advice `(d, region)` | **J** (join coherence) |
 
-Tables B, C, D, and E provide the helper constraints around Table A and F:
-Table B proves the Poseidon2 permutations, Table C proves the leaf-sponge
-state transitions, Table D supplies the private input batch (sorted), and Table E
-range-checks every junction depth.
-
-### Example
-
-Consider the consistency proof:
-
-`S(h_a), S(h_b), L(L_c), N(d₁), N(d₂)`
-
-for the single-element batch `B = {(k, v)}`,
-
-with derived hashes
-`hN1 = node_hash(h_b, leaf_hash(k_c, v_c), d₁)` and
-`new_root = node_hash(h_a, hN1, d₂)`.
-
-The trees look like this:
-```mermaid
-flowchart TB
-    classDef unchg fill:#eef,stroke:#447
-    classDef new fill:#cfc,stroke:#393
-    classDef chg fill:#ffe,stroke:#a90
-
-    subgraph OLD["pre-state"]
-      direction TB
-      O2["N(d₂) = old_root"]:::unchg
-      OA["L_a · h_a"]:::unchg
-      OB["L_b · h_b"]:::unchg
-      O2 --> OA
-      O2 --> OB
-    end
-
-    subgraph NEW["post-state"]
-      direction TB
-      N2["N(d₂) = new_root"]:::chg
-      NA["L_a · h_a"]:::unchg
-      N1["N(d₁)  [new]"]:::new
-      NB["L_b · h_b"]:::unchg
-      NC["L_c  [new]"]:::new
-      N2 --> NA
-      N2 --> N1
-      N1 --> NB
-      N1 --> NC
-    end
-```
-
-For reference, the verification using a stack machine would compute like this:
-
-```
-S(h_a)   push (h_a, h_a)           ; sibling with unchanged subtree (pre = post)
-S(h_b)   push (h_b, h_b)           ; sigling with unchanged subtree
-L        h_c <- leaf_hash(pop(B))  ; pop leaf from sorted batch, hash it
-         push (Null, h_c)          ; prev. must be Null for every new leaf
-N(d₁)    Null, h_c = pop           ; pop right sibling, depth is given
-         h_b, h_b = pop            ; pop left sibling
-         h_b = resolve_old_state(Null, h_b, d₁)  ; pass-through rule, one sibling
-         hN1 <- node_hash(h_b, h_c, d₁)          ; after - always both siblings
-         push (h_b, hN1)
-N(d₂)    h_b, hN1 = pop
-         h_a, h_a = pop
-         h0 <- resolve_old_state(h_a, h_b, d₂)   ; no pass-through, both siblings
-         h1 <- node_hash(h_a, hN1, d₂)
-         push (h0, h1)             ; push result (h0=old_root, h1=new_root)
-```
-
-In the case of AIR arithmetization, the resulting witness for the same batch and proof, instantiated as Tables A, F, D, look like this: (each table row below is one
-real row; arrows are LogUp bus sends/receives, Tables B, C, E omitted):
+### Data flow across all tables
 
 ```mermaid
-flowchart
-    classDef tbl fill:#fff,stroke:#447
-    classDef bnd fill:#fde,stroke:#a33,stroke-width:2px
-    classDef priv fill:#efe,stroke:#393
+flowchart LR
+    classDef t fill:#eef,stroke:#447,color:#113
+    classDef help fill:#f7f7ff,stroke:#88a,color:#113
+    classDef pub fill:#fde,stroke:#a33,color:#311
 
-    TA["<table>
-      <tr><th colspan='6'>Table A: verification rows</th></tr>
-      <tr><th>row</th><th>op</th><th>old</th><th>new</th><th>flags</th><th>pointers</th></tr>
-      <tr><td>0</td><td>S</td><td>h_a</td><td>h_a</td><td>old_is_none=0</td><td></td></tr>
-      <tr><td>1</td><td>S</td><td>h_b</td><td>h_b</td><td>old_is_none=0</td><td></td></tr>
-      <tr><td>2</td><td>L</td><td>0</td><td>leaf_hash(k_c,v_c)</td><td>old_is_none=1<br/>batch_idx=0</td><td></td></tr>
-      <tr><td>3</td><td>N(d₁)</td><td>h_b<br/>(b10 passthrough)</td><td>hN1</td><td>node_hash_old_needed=0</td><td>left_ptr=1<br/>right_ptr=2</td></tr>
-      <tr><td>4</td><td>N(d₂)<br/>← last real</td><td>old_root</td><td>new_root</td><td>node_hash_old_needed=1<br/>(b11)</td><td>left_ptr=0<br/>right_ptr=3</td></tr>
-    </table>"]:::tbl
+    L[["L · fused leaf<br/>new + opened"]]:::t
+    A[["A · proof rows<br/>one per opcode"]]:::t
+    J[["J · joins<br/>coherence + four-way"]]:::t
+    O[["O · openings<br/>canonical region"]]:::t
+    B(["B · Poseidon2"]):::help
+    R(["R · R10 range"]):::help
+    P(["P · powers of two"]):::help
+    Root(["public roots"]):::pub
 
-    TF["<table>
-      <tr><th colspan='6'>Table F: N-Join rows</th></tr>
-      <tr><th>row</th><th>parent</th><th>left</th><th>right</th><th>rule</th><th>result</th></tr>
-      <tr><td>F0</td><td>parent_row_idx=3<br/>N(d₁)</td><td>(h_b, h_b, none=0)</td><td>(0, leaf_hash, none=1)</td><td>b10=1</td><td>parent_old=h_b<br/>parent_new=hN1</td></tr>
-      <tr><td>F1</td><td>parent_row_idx=4<br/>N(d₂)</td><td>(h_a, h_a, none=0)</td><td>(h_b, hN1, none=0)</td><td>b11=1</td><td>parent_old=node_hash(...)<br/>parent_new=new_root</td></tr>
-    </table>"]:::tbl
-
-    TD["<table>
-      <tr><th colspan='3'>Table D: batch</th></tr>
-      <tr><th>idx</th><th>key</th><th>value</th></tr>
-      <tr><td>0</td><td>k_c</td><td>v_c</td></tr>
-    </table>"]:::priv
-
-    Pub(["public values<br/>old_root, new_root"]):::bnd
-
-    TA -- "Bus 1 · rows 1,2 → children of N(d₁)" --> TF
-    TA -- "Bus 1 · rows 0,3 → children of N(d₂)" --> TF
-
-    TF -- "Bus 3 · F0 parent tuple → A row 3" --> TA
-    TF -- "Bus 3 · F1 parent tuple → A row 4" --> TA
-
-    TD -. "Bus 6 → Table C → Bus 4 · feeds A row 2" .-> TA
-
-    TA -- "boundary: last real row pins roots" --> Pub
+    L -->|"leaf: digest+key"| A
+    A -->|"tree + advice"| J
+    J -->|"parent + advice"| A
+    O -->|"parent + advice"| A
+    B -->|"p2ff / p2term"| L
+    B -->|"p2ff / p2term"| J
+    B -->|"p2ff / p2term"| O
+    R -->|"range"| L
+    R -->|"range"| J
+    R -->|"range"| O
+    P -->|"pow2"| J
+    P -->|"pow2"| O
+    A ==>|"boundary: last row"| Root
 ```
 
-- Bus 1 multiset: each of rows 0, 1, 2, 3 is consumed exactly once as a
-  child by exactly one F row. Row 4 is the last real row, hence does not
-  send Bus 1 -- it is consumed by the boundary rule instead.
-- Row 3 illustrates **`b10` passthrough**: `right` was `None`, so
-  `parent_old = left.old = h_b`; no Bus 2 receive of an old hash and
-  `node_hash_old_needed = 0`.
-- Row 4 illustrates **`b11` full hash**: both children existed in the
-  old tree, so Table F receives Bus 2 *twice* for this row (once for
-  `parent_new`, once for `parent_old`), and `node_hash_old_needed = 1`.
-- Bus 5 (range-check `depth ∈ [0, 256)`) constrained on rows 3 and 4.
-- The verifier never sees `k_c, v_c, h_a, h_b, hN1` -- only the two
-  public roots; the bus chain ties the private batch row in Table D to
-  the public boundary on Table A row 4.
+The batch and proof stay private — they exist only in committed traces. The
+**verifier reconstructs every AIR and its preprocessing from the public shape
+alone** (scalar row counts), never consuming a prover object, then checks local
+constraints, the public roots, and every LogUp balance
+([`docs/r3/02`](docs/r3/02-relation-and-extraction.md), S10).
 
-## The AIR tables
+---
 
-All six AIRs share a single main commitment via `p3-batch-stark`. Each is
-padded independently to a power of two rows, "real" means not a padding row.
+## The tables
 
+Seven AIRs, each padded independently to a power of two ("real" = not a padding
+row). The three coherence/leaf tables `A/L/J/O` carry the statement; `B/R/P` are
+fixed helpers. Widths below are the realized main-column counts.
 
-```mermaid
-classDiagram
-    direction LR
-    class TableA["A: Verification opcodes"] {
-      one row per S/L/N opcode
-      is_s, is_l, is_n   one-hot
-      depth, batch_idx
-      old_hash, new_hash, old_is_none
-      left_ptr, node_hash_old_needed
-    }
-    class TableF["F: N-Join"] {
-      one row per N opcode
-      left_*, right_*, parent_*  tuples
-      case bits b01, b10, b11
-      parent_old_tail, parent_new_tail
-    }
-    class TableB["B: Poseidon2 perm."] {
-      VectorizedPoseidon2Air width 16
-      8 lanes per row
-      input[16] -> output[16]
-    }
-    class TableC["C: Leaf sponge"] {
-      3 rows per leaf (steps 0,1,2)
-      key[9], value[9]
-      state_in[16], state_out[16]
-    }
-    class TableD["D: Input batch"] {
-      preprocessed-only (private input)
-      idx, key[9], value[9]
-    }
-    class TableE["E: u8 range"] {
-      256 rows
-      byte, mult
-    }
+### Table A — proof rows (reduced, 33 cols)
 
-    TableA --> TableF : Bus 1 tree <br> child tuple per non-last real row
-    TableF --> TableA : Bus 3 parent <br> to N rows
-    TableC --> TableA : Bus 4 leaf_hash <br> digest to L rows (step 2)
-    TableE --> TableA : Bus 5 u8 <br> range-check depth in [0,256)
-    TableB --> TableF : Bus 2 p2 <br> parent_new always, parent_old iff b11
-    TableB --> TableC : Bus 2 p2 <br> every sponge step (in[16], out[16])
-    TableD --> TableC : Bus 6 batch <br> (idx, key, value) on step 2
-```
+One row per opcode. A one-hot selector `(is_s, is_o, is_ol, is_l, is_n)` drives
+opcode-specific rules over the digest pair `old[8]/new[8]`, `old_is_none`, the
+advice tuple `(delta, rho[9])`, and `subtree_start`. Compared with the legacy
+Table A it **drops four columns** — `batch_idx`, `opened_idx`, `has_advice`, and
+`node_hash_old_needed`: leaves/openings bind to A by **row index** (the bus
+keys), `has_advice` is the derived expression `1 − is_s`, and `b11` is derived by
+Table J. This is what makes A **verifier-independent** — nothing is round-tripped
+that the verifier cannot recompute.
 
-### Table A: Verification rows
+**Local constraints.** Selector booleanity + one-hot; `S/O/Oₗ ⇒ old = new`;
+`L ⇒ old = 0 ∧ old_is_none = 1`; `S ⇒ delta = 0 ∧ rho = 0`; `L/Oₗ ⇒ delta = κ`
+(256); base-opcode `subtree_start = row_idx`, root `subtree_start = 0`; padding
+rows syntactically zero. **Boundary:** the last real row's `(old, new)` equals
+the public `(old_root, new_root)` and its `old_is_none` equals the public
+`old_root_is_none` (17 public values — genesis `None` vs `Some[0;8]`, S1). Max
+local degree **2**.
 
-> *Replays the verifier's opcode stream, one row per opcode.*
+### Table L — fused canonical leaf (93 cols)
 
-One row per `S/L/N` opcode. A one-active selector (`is_s, is_l, is_n`) drives
-opcode-specific constraints: `S` rows must satisfy `old_hash = new_hash`
-(unchanged subtree); `L` rows must have `old_hash = 0` and `old_is_none = 1`
-(fresh leaf); `N` rows carry `depth`, `left_ptr`, and a single bit
-`node_hash_old_needed` indicating whether the parent's old digest came from
-the four-way rule's `b11` branch. Boundary constraints on the *last real*
-row pin `(old_hash, new_hash) = (public_old_root, public_new_root)`.
+One row per `L` or `Oₗ`, replacing the old three-row leaf sponge (**C**) *and* the
+batch/canonical-digit table (**D**). Columns: `a_row_idx`, `key_digits[26]`,
+`value_digits[26]`, `mid_0[16]`, `mid_1[16]`, `digest[8]`. The nine key and value
+limbs are **linear expressions** `Σ dᵢ·1024ⁱ` in the 26 radix-1024 digits — never
+stored columns — and each digit is range-checked at its fixed width against
+Table R. That range check makes the reconstruction injective to **exactly 32
+bytes** of key and 32 of value (soundness lemma **S4**; this closes the old
+`pack_value_32` truncation/aliasing gap). The three leaf-sponge permutations
+(steps 0/1 feed-forward to `mid_0`/`mid_1`, step 2 terminal to `digest`) are bound
+to Table B on `p2ff`/`p2term`; `digest` + key limbs are sent to A on the `leaf`
+bus. Every check rides a bus — the only local rule is padding hygiene.
 
-**Constraints**
-- Boolean-ness and one-active of opcode selectors.
-- `S -> old = new`; `L -> old = 0 ∧ old_is_none = 1`; canonical zeroing
-  `old_is_none · old_hash[j] = 0`.
-- Padding-row syntactic zero: `(1 − is_real) · column[j] = 0` for every
-  witness column.
-- Boundary: last real row's digests equal the public roots.
-- Bus 1 *send* on every non-last real row (consume by some F row).
-- Bus 3 *receive* on `N` rows (parent digest comes from F).
-- Bus 4 *receive* on `L` rows (digest comes from C step 2).
-- Bus 5 *send* on `N` rows (range-check `depth ∈ [0, 256)`).
+### Table J — junctions (joins only, 142 cols)
 
-```mermaid
-classDiagram
-    direction LR
-    class TableA["Table A: Verification rows"] {
-      preproc: row_idx, is_real, is_last_real
-      is_s, is_l, is_n   (one-hot opcode)
-      depth, batch_idx
-      old_hash[8], new_hash[8]
-      old_is_none
-      left_ptr
-      node_hash_old_needed
-      boundary: last real row pins (old_root, new_root)
-    }
-    class TableF["F: N-Join"]
-    class TableC["C: Leaf sponge"]
-    class TableE["E: u8 range check"]
+One row per `N`. Carries the R10 coherence block, the four-way old-state, and the
+node hash. **Coherence (D13):** a shared prefix `H` with `p[q] = 2·pow_b·H`,
+constant side bits (`β_l = 0`, `β_r = 1`), and radix-1024 decompositions of `H`
+(`< 2^r`) and each child tail `L_x` (`< 2^k`), so `ρ_l[q] = p[q] + L_l` and
+`ρ_r[q] = p[q] + pow_b + L_r`; because both advised children share `p[9]`, "the
+derived regions agree" is automatic (**S6**). A one-hot `q` selects the boundary
+limb (`depth = limb_start(q) + r_off`), materialized `width_r/width_k` keep the
+range tuples degree 1, and `pow_b` is anchored to Table P. **Four-way old state
+(S7):** case bits `b00/b01/b10/b11` from the child `None` flags select
+`None` / passthrough-right / passthrough-left / `hash_node(old_l, old_r)`; the new
+side always re-hashes. Confinement: both children advised for a new junction.
+**Node sponge:** the prefix `P2(DOMAIN_NODE, d, p, 0…)` is one `p2ff` receive
+(its `mid` feeds both children blocks); the new children block is one `p2term`
+receive, the old one more **iff `b11`** — the digest slot *is* `parent_new`/
+`parent_old`, binding the propagated digest to a real permutation. Max degree
+**3**.
 
-    TableA --> TableF : Bus 1 send <br> non-last real row child tuple
-    TableF --> TableA : Bus 3 recv <br> parent tuple, gated is_n
-    TableC --> TableA : Bus 4 recv <br> (batch_idx, digest), gated is_l
-    TableA --> TableE : Bus 5 send <br> depth, gated is_n
-```
+### Table O — openings (canonical region, 89 cols)
 
-### Table F: N-Join
+One row per `O`, split out of the old union table so an opening pays opening
+width, not join width — and, crucially, **range-checks the opened region**, which
+the union table never did. Columns: `a_row_idx`, `depth`, `region_digits[26]`,
+one-hot `q[9]`, `r_off`, `pow_b`, `H`-digits, `left/right_digest[8]`,
+`prefix_mid[16]`, `digest[8]`. Local boundary constraints make the region a
+**genuine left-aligned `depth`-bit prefix** (**S5**): the boundary limb
+`region[q] = 2·pow_b·H` with `H < 2^r_off`, all limbs below `q` zero, and every
+full prefix limb a canonical 30/16-bit integer via its range-checked digits.
+`depth < 256` is enforced by the pow2 exponent, so no separate depth check is
+needed. The node prefix (`p2ff`) and children block (`p2term`) hash the
+reconstructed region; the parent tuple is sent to A. Depths `0/239/240/255` have
+dedicated tests. Max degree **3**.
 
-> *One row per junction (`N`) opcode, holding both child tuples and the
-> parent tuple side-by-side so the four-way old-state rule is a local
-> constraint.*
+### Helper tables B, R, P
 
-Each row carries 17 columns of `(left_old[8], left_new[8], left_none)`,
-17 of `(right_old, right_new, right_none)`, 17 of parent, plus the three
-explicit case bits `b01, b10, b11` and the bottom-8 outputs of the parent's
-node-hash Poseidon2 evaluations (`parent_old_tail[8]`,
-`parent_new_tail[8]`).
-
-**Constraints**
-- Boolean-ness of all none-bits and case-bits; `b01, b10, b11` algebraically
-  fixed to the products of the none-bits.
-- `parent_none = left_none · right_none`.
-- **Four-way pass-through rule**: `(1 − b11) · parent_old[j] = b01 ·
-  right_old[j] + b10 · left_old[j]` for `j = 0..7`.
-- Tail canonical zeroing: `(1 − b11) · parent_old_tail[j] = 0` --
-  pass-through rows do not receive an old hash through Bus 2, so the tail must not
-  carry smuggled values.
-- Locality: `right_ptr = parent_row_idx − 1`.
-- Padding rows are zero.
-- Bus 1 *receive* twice per row (left and right children).
-- Bus 2 *receive* for `parent_new` always; for `parent_old` only when
-  `b11 = 1`.
-- Bus 3 *send* of the parent tuple to Table A.
-
-```mermaid
-classDiagram
-    direction LR
-    class TableF["Table F: N-Join"] {
-      preproc: is_real_f
-      parent_row_idx, left_ptr, right_ptr, depth
-      left_old[8], left_new[8], left_none
-      right_old[8], right_new[8], right_none
-      parent_old[8], parent_new[8], parent_none
-      b01, b10, b11   (derived selectors)
-      parent_old_tail[8], parent_new_tail[8]
-      locality: right_ptr = parent_row_idx − 1
-    }
-    class TableA["A: Verification opcodes"]
-    class TableB["B: Poseidon2 perm"]
-
-    TableA --> TableF : Bus 1 recv <br> left children
-    TableA --> TableF : Bus 1 recv <br> right children
-    TableF --> TableA : Bus 3 send <br> parent tuple
-    TableB --> TableF : Bus 2 recv <br> parent_new always (mult is_real_f)
-    TableB --> TableF : Bus 2 recv <br> parent_old iff b11=1
-```
-
-### Table B: Poseidon2 permutation
-
-> *Every Poseidon2 evaluation needed anywhere in the proof -- leaf hash
-> sponge permutations and junction node hash permutations.*
-
-Built directly from `p3-poseidon2-air::VectorizedPoseidon2Air<WIDTH=16,
-SBOX_DEGREE=7, HALF_FULL_ROUNDS=4, PARTIAL_ROUNDS=13, VECTOR_LEN=8>`. The
-inner constraints (provided by Plonky3) check that each lane is a real
-Poseidon2(BabyBear, width 16) evaluation. The rsmt layer adds only an
-8-column preprocessed lane mask: padded lanes are still real evaluations of
-`[0; 16]` (so the inner constraints hold), but their Bus 2 *send*
-multiplicity is masked to zero.
-
-**Constraints**
-- Plonky3 internal: each row encodes one valid Poseidon2 permutation.
-- Per-lane Bus 2 *send* of `(input[16] || output[16])` at multiplicity
-  `is_real_lane[lane]`. Eight separate `Lookup`s (one per lane); rsmt-air
-  uses one tuple per `register_lookup` call so each tuple gets its own aux
-  column set.
-
-```mermaid
-classDiagram
-    direction LR
-    class TableB["Table B: Poseidon2 permutation"] {
-      VectorizedPoseidon2Air<16, 7, 1, 4, 13, 8>
-      preproc: 8-col lane mask (is_real_lane)
-      8 lanes per row
-      input[16] -> output[16] per lane
-      8 separate Lookups (one per lane, workaround)
-      padding lanes hash [0;16] with mult=0
-    }
-    class TableF["F: N-Join"]
-    class TableC["C: Leaf sponge"]
-
-    TableB --> TableF : Bus 2 send <br> parent_new (always) + parent_old (iff b11)
-    TableB --> TableC : Bus 2 send <br> every leaf-sponge step (in[16] || out[16])
-```
-
-### Table C: Leaf sponge controller
-
-> *Three rows per leaf, replaying the sponge state evolution and
-> squeezing out the leaf digest.*
-
-Preprocessed columns `leaf_idx, is_step_0, is_step_1, is_step_2, is_real_c`
-hard-wire the row layout `[0,0,0, 1,1,1, 2,2,2, …]` once `B` is known, so
-each `leaf_idx` automatically gets exactly one `is_step_2` row. Witness
-columns hold `key[9], value[9], state_in[16], state_out[16]`.
-
-**Constraints**
-- Step-0 initialization: `state_in[0] = DOMAIN_LEAF`, `state_in[1+j] =
-  key[j]` for `j = 0..6`, `state_in[8..16] = 0`.
-- Step transitions (gated by next-row's preprocessed indicator): `next.
-  state_in[j] = local.state_out[j] + injection[step][j]`
-- Key/value continuity within one leaf.
-- Padding is zeroed.
-- Bus 2 *receive* of `(state_in[16] || state_out[16])` per real row.
-- Bus 4 *send* of `(leaf_idx, state_out[0..8])` on step 2 only.
-- Bus 6 *receive* of `(leaf_idx, key[9], value[9])` on step 2 only.
-
-```mermaid
-classDiagram
-    direction LR
-    class TableC["Table C: Leaf sponge"] {
-      preproc: leaf_idx, is_step_0, is_step_1, is_step_2, is_real_c
-      key[9], value[9]
-      state_in[16], state_out[16]
-      step-0 init: state_in[0] = DOMAIN_LEAF, state_in[1..8] = key[0..6]
-      transitions: next.state_in = state_out + injection[step]
-      key/value continuity within one leaf
-    }
-    class TableB["B: Poseidon2"]
-    class TableA["A: Verification opcodes"]
-    class TableD
-
-    TableB --> TableC : Bus 2 recv <br> (state_in[16] || state_out[16]) per row
-    TableC --> TableA : Bus 4 send <br> (leaf_idx, state_out[0..8]) on step 2
-    TableD --> TableC : Bus 6 recv <br> (idx, key, value) on step 2
-```
-
-### Table D: Sorted batch (preprocessed-only)
-
-Width 1 dummy main column (Plonky3 batch-STARK requires a non-empty main
-trace per instance). Preprocessed: `idx, is_real_d, key[9], value[9]`. The
-prover sorts and packs into 30-bit elements the batch *before* materializing this
-trace -- the 30-bit split is inherited by construction; no in-circuit
-bit decomposition.
-
-**Constraints**
-- Bus 6 *send* of `(idx, key[9], value[9])` at multiplicity `is_real_d`.
-
-The verifier constructs Table D via `TableDAir::shape_only(padded_height)`
-(no batch data); the prover-side preprocessed commitment lands in
-`prover_data.common.preprocessed`, transcript-bound to the rest of the
-proof.
-
-```mermaid
-classDiagram
-    direction LR
-    class TableD["Table D: Sorted batch"] {
-      preprocessed-only
-      idx, is_real_d
-      key[9], value[9]   (30-bit BabyBear elements)
-      width-1 dummy main column
-      verifier-side: TableDAir::shape_only(padded_height)
-    }
-    class TableC["C: Leaf sponge"]
-
-    TableD --> TableC : Bus 6 send <br> (idx, key, value) at mult is_real_d
-```
-
-### Table E: `u8` range check
-
-> *256 rows of bytes; multiplicities count each `depth ∈ [0, 256)`.*
-
-Preprocessed: 1 column `byte ∈ {0, 1, …, 255}`. Witness: 1 column `mult`,
-unconstrained locally -- LogUp's multiset balance on Bus 5 enforces that
-`mult[b]` equals the number of N rows in Table A with `depth = b`.
-
-```mermaid
-classDiagram
-    direction LR
-    class TableE["Table E: u8 range"] {
-      256 rows (fixed height)
-      preproc: byte ∈ (0..255)
-      witness: mult (per-byte multiplicity)
-      mult unconstrained locally; LogUp balance ties it to Bus 5 receivers
-    }
-    class TableA["A: Verification opcodes"]
-
-    TableE --> TableA : Bus 5 send <br> key = depth, mult is_real · is_n
-```
+- **B — Poseidon2.** `VectorizedPoseidon2Air` over the occurrence-correct
+  permutation plan, 8 lanes per row (dominant width ~2384). Each real perm is
+  one occurrence (**no deduplication** — completeness lemma S8); the plan is
+  segmented feed-forward-then-terminal, and B *sends* the full
+  `(input[16] ‖ output[16])` on **`p2ff`** and `(input[16] ‖ output[0..8])` on
+  **`p2term`**, with the ff/term masks derived from the scalar counts
+  `(n_ff, n_term)` — no `Vec<bool>` in the public shape. The sole source of truth
+  that every in-circuit "hash" is a genuine Poseidon2 evaluation.
+- **R — R10 range.** `{(bits, value) : 0 ≤ bits ≤ 10, value < 2^bits}` — 2047
+  real rows + a padding row, with a multiplicity column. One `range` bus serves
+  L's 52 key/value digits, J's depth/`H`/tail/gap, and O's region/`H` digits.
+  `mult` is locally free, fixed by LogUp balance (**S9**).
+- **P — powers of two.** 31 rows `(r, 2^r)`, `r ∈ [0,30]`; the `pow2` bus serves
+  the coherence/boundary power `pow_b = 2^{W−r−1}` for J and O.
 
 ---
 
 ## LogUp buses
 
-Six global buses (`Kind::Global(name)`), each with one extension-field
-auxiliary column per AIR. Per-bus challenges `(α, β) ∈ EF = BabyBear^4` are
-sampled after producing the main commitment.
+Seven global buses (Bus 2 is realized as two — `p2ff` + `p2term`), one
+extension-field aux column per AIR per tuple; per-bus challenges
+`(α, β) ∈ 𝔽_{p⁴}` sampled after the main commitment. **One entry per context** —
+the two-entry pairing optimization was gated out
+([`docs/r3/08`](docs/r3/08-m9-logup-pairing.md)).
 
-| # | Name | Tuple | Sender | Receiver |
-|---|---|---|---|---|
-| 1 | `tree` | `(row_idx, old_hash[8], new_hash[8], old_is_none)` | A non-last real rows | F left + F right |
-| 2 | `p2` | `(input[16], output[16])` | B per real lane | F new (always) + F old (when `b11`) + C real rows |
-| 3 | `parent` | `(parent_row_idx, parent_old[8], parent_new[8], parent_none, depth, node_hash_old_needed)` | F | A `N` rows |
-| 4 | `leaf_hash` | `(batch_idx, digest[0..8])` | C step 2 | A `L` rows |
-| 5 | `u8` | `(byte)` | E | A `N` rows (key = `depth`) |
-| 6 | `batch` | `(idx, key[0..9], value[0..9])` | D | C step 2 |
+| name | tuple | sender → receiver |
+|---|---|---|
+| `tree` | `(row_idx, subtree_start, old[8], new[8], old_none, has=1−is_s, delta, rho[9])` | A non-last rows → J children |
+| `p2ff` | `(input[16], output[16])` | B feed-forward → L steps 0/1, J/O prefix |
+| `p2term` | `(input[16], output[0..8])` | B terminal → L step 2, J/O children |
+| `parent` | `(row_idx, old[8], new[8], old_none, delta, rho[9], subtree_start)` | J/O → A `N`/`O` rows |
+| `leaf` | `(row_idx, digest[8], key[9])` | L → A `L`/`Oₗ` rows |
+| `range` | `(bits, value)` | R → L/J/O digits, depths, gaps |
+| `pow2` | `(r, 2^r)` | P → J/O boundary powers |
 
-Why this set is sufficient (intuitively):
-- **Bus 1** + `right_ptr = parent_row_idx − 1` ~ "post-order tree shape".
-- **Bus 3** binds each `N` row in Table A to exactly one row in Table F.
-- **Bus 2** forces every node-hash and every leaf-sponge step to be a real
-  Poseidon2 evaluation.
-- **Bus 4** + **Bus 6** force every `L` row to consume one final-step digest
-  and every final step to consume one batch row -> `L.batch_idx = D.idx`.
-- **Bus 5** range-checks `depth ∈ [0, 256)`.
+The `parent` tuple **drops** the legacy `nhon` field (J derives `b11` itself), and
+there is **no `batch` bus** (no batch table). Why the set closes the statement:
 
-The chain `Bus 6 -> C -> Bus 4 -> A -> boundary` is the proof that the
-prover-supplied private batch was actually used to produce the public root
-transition. The verifier never sees the batch.
+- **`tree` + `subtree_start`** ⇒ a contiguous post-order tree (S2): the right
+  child is `parent−1`, the left `rs−1`, each `N` inherits its left child's start,
+  the root's start is `0`. Child indices strictly decrease and `tree` balance
+  gives each non-root in-degree 1, so the parent relation is acyclic and spanning
+  — one genuine tree, proved by algebra with **no Poseidon fixed-point
+  assumption**. The advice fields put `(depth, region)` in the same multiset, so
+  a junction cannot invent its children's advice (S3).
+- **`parent`** binds each `N`/`O` row to exactly one J/O row — digest, advice, and
+  `subtree_start` together (S3).
+- **`leaf`** binds each `L`/`Oₗ` row to one L row — digest **and** key limbs — so
+  `rho = key` advice is grounded in the run that produced the digest (S4).
+- **`p2ff`/`p2term`** force every sponge block and leaf step to be a real
+  Poseidon2; the terminal split binds each propagated digest to a real output
+  without carrying its capacity tail (S8).
+- **`range` + `pow2`** make the region comparisons and inputs sound: every digit,
+  depth, gap, and canonical key/value/region limb bounded, coherence/boundary
+  powers anchored (S5/S6/S9).
+
+The chain `L → leaf → A → boundary` (with `J/O → parent → A`) is the proof that a
+canonical private batch produced the public transition. The verifier never sees
+it.
+
+---
+
+## Worked example
+
+Insert one leaf `c` that splits the edge above `b`, into a two-leaf tree.
+Honest proof: `S(h_a), Oₗ(k_b,v_b), L, N(d₁), N(d₂)`. Note `b` sits under
+the *new* junction `N(d₁)`, so it is **opened**; `a` stays under the
+*pre-existing* `N(d₂)` and remains an opaque `S`.
+
+```mermaid
+flowchart LR
+    classDef u fill:#eef,stroke:#447,color:#113
+    classDef n fill:#cfc,stroke:#393,color:#131
+    classDef c fill:#ffe,stroke:#a90,color:#331
+
+    subgraph OLD["pre-state · old_root"]
+        direction TB
+        O2["N(d₂,p₂)"]:::u
+        O2 --> OA["Leaf a · h_a"]:::u
+        O2 --> OB["Leaf b · h_b"]:::u
+    end
+
+    subgraph NEW["post-state · new_root"]
+        direction TB
+        M2["N(d₂,p₂)"]:::c
+        M2 --> MA["Leaf a · h_a<br/>(S — opaque)"]:::u
+        M2 --> M1["N(d₁,p₁) [new]"]:::n
+        M1 --> MB["Leaf b · h_b<br/>(Oₗ — opened)"]:::u
+        M1 --> MC["Leaf c [new]"]:::n
+    end
+
+    OLD ~~~ NEW
+```
+
+Stack-machine trace (advice shown; `p₁ = k_b[0..d₁) = k_c[0..d₁)`,
+`k_b[d₁]=0`, `k_c[d₁]=1`):
+
+```
+S(h_a)        push (h_a, h_a, ⊥)                    ; opaque; legal under b11 below
+Oₗ(k_b,v_b)   push (h_b, h_b, (κ,k_b))              ; opened preserved leaf
+L             push (None, h_c, (κ,k_c))             ; h_c = leafhash(pop batch)
+N(d₁)         children advised (required: new)      ; k_b[d₁]=0, k_c[d₁]=1
+              p₁ = k_b[0..d₁) = k_c[0..d₁)          ; regions agree
+              push (h_b, nodehash(d₁,p₁,h_b,h_c), (d₁,p₁))   ; old = h_b (b10)
+N(d₂)         right advised: d₁>d₂, p₁[d₂]=1; p₂=p₁[0..d₂)
+              old = nodehash(d₂,p₂,h_a,h_b) = old_root
+              new = nodehash(d₂,p₂,h_a,hN1) = new_root
+              push (old_root, new_root, (d₂,p₂))
+```
+
+Same round as R3 AIR rows (B, R, P omitted):
+
+```mermaid
+flowchart LR
+    classDef tbl fill:#fff,stroke:#447,color:#113
+    classDef bnd fill:#fde,stroke:#a33,color:#311
+    classDef priv fill:#efe,stroke:#393,color:#131
+
+    TA["<b>Table A</b><br/>0 S    (h_a,h_a, ⊥)<br/>1 Oₗ   (h_b,h_b, (κ,k_b))<br/>2 L    (0,h_c, (κ,k_c))<br/>3 N(d₁)(h_b,hN1, (d₁,p₁))<br/>4 N(d₂)(old_root,new_root,(d₂,p₂)) ← last"]:::tbl
+    TL["<b>Table L</b><br/>row1 Oₗ : k_b,v_b digits → h_b<br/>row2 L  : k_c,v_c digits → h_c"]:::priv
+    TJ["<b>Table J</b><br/>J0 →A3 : L(h_b,(κ,k_b)) R(h_c,(κ,k_c))<br/>   k_b[d₁]=0 k_c[d₁]=1 → p₁ (shared H)<br/>J1 →A4 : L(h_a,⊥) R(hN1,(d₁,p₁)) b11<br/>   d₁>d₂ p₁[d₂]=1 → p₂"]:::tbl
+    Pub(["public roots<br/>old_root, new_root"]):::bnd
+
+    TL -->|"leaf · rows 1,2 → A1,A2"| TA
+    TA -->|"tree · rows 1,2 → J0"| TJ
+    TA -->|"tree · rows 0,3 → J1"| TJ
+    TJ -->|"parent → A3,A4"| TA
+    TA ==>|"boundary"| Pub
+```
+
+- J0 is a **new** junction: confinement makes `b` open (`Oₗ`), so both
+  children carry advice; coherence derives `p₁` from `k_b`/`k_c` (one shared
+  prefix `H`) and forces the split bit. J1 is **`b11`**, so the opaque `S(h_a)`
+  on its left is legal, and `p₂` is grounded by chaining the old side to
+  `old_root`.
+- Leaf `c` needs no batch table: it is the last `L` key in A-row order (Lemma B).
+  The zk verifier sees only the two public roots; the bus chain ties L's private
+  `(k_c, v_c)` to the boundary on A row 4.
+
+---
+
+## Security of the arithmetization
+
+The security question *of this repository* is faithfulness:
+
+> A STARK proof verifies **iff** there exist private inputs `(π, B)` on
+> which the reference verifier accepts `(π, old_root, new_root, B)`.
+
+Soundness is the ⇒ direction: any committed traces satisfying every local
+constraint and every LogUp balance encode an accepting run. Completeness
+is the ⇐ direction: the witness generator turns every accepting run into a
+satisfiable trace. What an accepting run *means* for the tree (append-only
+consistency, unicity, ...) is the paper's theorem, consumed here as given.
+
+### Assumptions
+
+1. **STARK layer.** `p3-uni-stark` quotient evaluation + `TwoAdicFriPcs`
+   low-degree test + Fiat–Shamir compose to a sound argument of knowledge
+   (~116 conjectured bits at the default config).
+2. **LogUp.** Per-bus challenges in `𝔽_{p⁴}` (`≈2^124`), sampled after the
+   main commitment: multiset error `≤ Σ padded_height / |𝔽_{p⁴}|`, below
+   `2^-100` in the parameter range used here.
+3. **Upstream Poseidon2 AIR.** `p3-poseidon2-air`'s constraints accept
+   exactly genuine Poseidon2(BabyBear, width 16) evaluations per lane.
+4. **Public statement.** The verifier knows `(old_root, new_root)`,
+   `old_root_is_none`, and the scalar shape; it **reconstructs every AIR and its
+   entire preprocessing commitment from that shape alone** — no prover object
+   crosses the boundary (S10, verifier-independence).
+
+Notably, hash *collision resistance* is not on this list -- the
+arithmetization is faithful regardless; collision resistance enters one
+level up, where the paper interprets accepting runs as tree facts. (Since
+D19, the tree-shape argument no longer borrows a Poseidon fixed-point
+assumption either — see the functional-graph note under *pitfalls*.)
+
+### Rule-by-rule constraint coverage
+
+Every rule of the reference verifier (`rsmt6a.verify_consistency`) must be
+covered by a constraint or a bus balance -- this table is the checklist:
+
+| reference-verifier rule | AIR mechanism |
+|---|---|
+| `S(c)` pushes `(c, c, ⊥)` | A: `is_s ⇒ old = new`, no-advice shape |
+| `O` hashes its opening | O row: canonical region + node sponge on `p2ff`/`p2term`; digest + `(d′,p′)` returned on `parent` |
+| `Oₗ` / `L` hash a leaf | L row: 26 range-checked digits reconstruct the key/value, sponge on `p2ff`/`p2term`; digest + key on `leaf` |
+| `L` consumes next batch element | extracted, not consumed: the `L`-key subsequence is strictly increasing in A-row order (topology + coherence, Lemma B) — no batch table |
+| `N` pops two children | `tree` multiset (each non-last A row consumed exactly once) + `subtree_start` chain (right = `parent−1`, left = `rs−1`, root start `0`) ⇒ contiguous post-order shape |
+| advice is what the child pushed | advice fields ride `tree`/`parent`/`leaf` *with* the digest — no mix-and-match |
+| `δ > d` per advised child | depth-gap `(8, gap)` receive on the `range` bus |
+| `ρ[d] = β` per advised child | boundary-limb R10 decomposition (`pow2` power + `range` digits) |
+| key/value limbs are byte-canonical | Table L radix-1024 digit reconstruction + `range` receives (`< 2^30`) |
+| `p = ρ[0..d)`, children agree | both children constrain the same `p[9]` columns |
+| `p` defined (≥1 advised) | `(1 − has_l)(1 − has_r) = 0` |
+| new junction ⇒ both advised | `(1 − b11)(2 − has_l − has_r) = 0` |
+| four-way old-state rule | J local case constraints + `p2term` for the `b11` hash |
+| `new = nodehash(d, p, n_l, n_r)` | prefix + children blocks on Bus 2 |
+| stack ends with one entry | boundary on the unique `is_last_real` row; every other real row sent on Bus 1 and consumed |
+| final entry = `(old_root, new_root)` | boundary constraints against public values |
+| proof + batch fully consumed | bus balances: unconsumed sends / receives unbalance LogUp |
+| batch strictly sorted, keys distinct | **not in-circuit** -- see scope notes |
+
+### Arithmetization pitfalls (why the non-obvious constraints exist)
+
+These are the spots where a missing constraint would break soundness even
+though the "happy path" works -- each is a required negative test:
+
+- **Digest truncation (tagged Bus 2).** A digest is 8 of 16 permutation
+  output limbs. A *feed-forward* output (a node prefix, a non-final leaf
+  step) is another block's input, so its full 16 limbs must be bound —
+  carried on `p2ff`. A *terminal* output is used only as a digest, so it is
+  carried on `p2term` as 8 limbs and the digest slot is the very column that
+  propagates (`parent_new`/`parent_old`, or the leaf digest). Splitting the
+  bus (rather than masking a tail) keeps every tuple degree 1 and leaves no
+  unbound tail that could satisfy the bus without a permutation behind it.
+- **Advice–digest co-travel.** If advice moved on its own bus, a prover
+  could pair row X's digest with row Y's advice. One tuple per bus, digest
+  and advice together, everywhere (Buses 1, 3, 4).
+- **Padding hygiene.** Padding rows must be syntactically zero (and Table
+  B's padding lanes are real `P2([0;16])` evaluations with bus
+  multiplicity masked to zero) -- otherwise padding contributes spurious
+  bus sends.
+- **One-hot selectors.** Opcode and case bits must be boolean *and*
+  mutually exclusive; a row that is "half `L`, half `N`" bypasses both
+  rule sets.
+- **Unique sender keys.** Bus 1 soundness leans on `row_idx` being a
+  preprocessed (verifier-fixed) column: multiset balance + unique keys ⇒
+  each row consumed exactly once. Same pattern for C's `leaf_idx`.
+- **Canonical region encoding.** Regions must be zero-padded below bit
+  `d` wherever they enter a hash (join rows by the coherence block,
+  opening rows by an explicit padding check) -- two encodings of one
+  region would break digest determinism.
+- **Canonical inputs.** Key/value field limbs must be range-checked to their
+  byte widths (`< 2^30`, top limb `< 2^16`) via Table L's digit
+  reconstruction — otherwise a prover commits a non-canonical field limb that
+  still hashes, forging a leaf preimage that no byte-encoded key produces.
+- **Range side-conditions.** `L`, `H` of the boundary-limb R10 split must be
+  range-bounded or the decomposition is ambiguous; depths must be bytes or
+  the one-hot/offset split of `d` is ambiguous.
+- **Functional-graph corner (closed by D19).** With the old free `left_ptr`,
+  Bus 1 closure made the parent-child structure a functional graph with one
+  sink, but a disjoint cycle whose digests happen to close under the buses
+  was not excluded *syntactically* — it needed a Poseidon2 fixed-point to be
+  ruled out. The `subtree_start` chain now excludes it algebraically: child
+  indices strictly decrease (right = `parent−1`, left = `rs−1`) so the parent
+  relation is acyclic, and the root's start `= 0` forces a single spanning
+  tree. No cryptographic assumption is borrowed here anymore.
+
+### Trace-tamper test matrix
+
+Constraint coverage is only believable with negative tests. Each test
+perturbs a *verifying* trace post-build and asserts proving or verification
+fails (a violated constraint surfaces as a prover-side `check_constraints`
+panic or a `verify_batch` error — either is a rejection). Two layers exist:
+the per-table `check_constraints` negatives in `rsmt-air`, and the
+end-to-end sweep in `rsmt-prover::tamper` (M5), which runs a full round
+through `prove_batch`/`verify_batch`. Together they touch every bus and
+every local constraint family:
+
+| family | tamper |
+|---|---|
+| tree shape (D19) | swap children; corrupt a base row's `subtree_start`; corrupt a join's `ls`/`rs` |
+| digest algebra | break a passthrough; forge `old_is_none`; scramble an A digest; forge `parent_new` (bound by `p2term`); tamper a feed-forward `mid` limb |
+| coherence | flip a bit of derived `p`; flip advice `rho` in transit; `δ ≤ d`; out-of-range `L`/`H` digits; break `p`'s zero-padding; drop advice under a new junction (the reference shadow-insertion vector) |
+| inputs | non-canonical key/value limb (Table L digit reconstruction / range) |
+| kind/advice binding | opened digest consumed by `L`; batch digest consumed by `Oₗ`; one row's digest with another's advice |
+| helpers | inflate a Table R (range) multiplicity; inflate a Table P (pow2) multiplicity |
+
+### Scope notes
+
+- **Tree-level meaning** of an accepting run -- append-only consistency,
+  canonical placement, unicity across rounds -- is proven in the
+  aggregation-layer paper and exercised in `ndsmt-experiments/rsmt6a.py`.
+  This repo inherits, and must not weaken, the statement; it adds nothing
+  to it.
+- **Batch sortedness / distinctness** is not checked in-circuit. It is
+  provably redundant for soundness (duplicate keys make the coherence
+  constraints unsatisfiable; sort order only fixes the prover's own
+  assignment of batch rows to `L` positions) -- external sort/dedup is a
+  completeness convenience of the witness generator.
+- **Empty pre-state / empty batch.** Genesis pins the canonical `None`
+  digest at the boundary; the empty-batch identity transition is handled
+  by the caller, not this AIR.
+- **Zero-knowledge.** The default FRI config is succinct but not zk:
+  private inputs can be found in unmasked committed traces. For zk, use
+  `FriParameters::new_benchmark_zk` with masking columns -- out of scope
+  (the goal is verifier work reduction, not input privacy).
+
+---
+
+## Cost projection
+
+Table B (Poseidon2) dominates cell count — its per-row main width (≈2384 =
+`P2_PERM_WIDTH × 8` lanes) is the arithmetic cost of a genuine permutation and
+dwarfs every logical table (the widest of those is J at **142**; L is 93, O is
+89, A is 33). Because B is inherent and unchanged, R3 costs essentially the same
+as the pre-R3 pipeline while being sound: at prefill 1024 / batch 64, total
+committed cells fell ~3 % (B-dominated) but **leaf work dropped ~64 %** (the old
+C+D's ~33.9 k cells → L's ~12 k) and the non-B tables ~17 %, with prove+verify
+unchanged. Measured numbers and the baseline comparison are in
+[`docs/r3/07`](docs/r3/07-r3-cost.md). Committed cells grow ~linearly in the
+batch size (the `rsmt-bench perf` sweep confirms this).
+
+---
+
+## Parameter choice
+
+Proving time is not the only goal: a production configuration balances
+**security bits, proof size, proving time, and recursion friendliness**, with
+parameters. The M10 FRI grid ([`docs/r3/09`](docs/r3/09-m10-fri-grid.md))
+settled on **`log_blowup = 2` (rate ¼), 64 queries, no grinding** — the frozen
+`R3_FRI`:
+
+- **128 conjectured bits** — a clean power-of-two query count, comfortable margin;
+- **no grinding** — a PoW loop is very expensive to re-run in a recursive
+  verifier, and it earns nothing on any other axis;
+- **only 64 query openings** — half the in-circuit Merkle work of a rate-½
+  config, the dominant recursion cost;
+- **~1.3 MB proof, ~67 ms verify** — the smallest/fastest tier.
+
+The one cost is prover time (rate ¼ doubles the LDE, ~+40 %), a one-time prover
+expense — while proof size, verify time, query count, and grinding-freedom all
+help every downstream and recursive verifier. `(log_blowup = 1, 116 queries, 0
+PoW)` is the documented alternative when prover throughput is the priority.
 
 ---
 
 ## Performance harness
 
-The `rsmt-bench` binary runs prove + verify across configurable batch sizes
-and FRI parameters, reporting per-table cell counts and timings.
+`rsmt-bench` runs prove + verify across batch sizes and FRI parameters (via
+`prove_r3_round` / `verify_r3_round`), reporting per-table cell counts and
+timings.
 
 ```bash
 cargo build --workspace --release
-./target/release/rsmt-bench perf [FLAGS]
-
-# Example: pre-insert 100,000 random leaves, then prove fresh batches of 256 and 1024 leaves.
 ./target/release/rsmt-bench perf --prefill 100000 --batches 256,1024
 ```
 
-### `perf` subcommand flags
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--batches` | `16,64,256` | Comma-separated list of batch sizes to sweep. |
-| `--prefill` | `0` | Pre-insert this many random leaves into the tree before generating each measured batch proof. |
-| `--seed` | `0` | RNG seed for batch + Fiat–Shamir (deterministic). |
-| `--log-blowup` | `1` | FRI Low Degree Extension rate, `log_2(blowup)`. Larger results with bigger LDE on the prover, but each query is worth more soundness bits. |
-| `--num-queries` | `100` | Number of FRI query rounds. Linear in proof size and verifier work. |
-| `--query-pow-bits` | `16` | Grinding bits before sampling queries. Adds prover work; reduces queries needed for the same soundness. |
-| `--max-log-arity` | `3` | Max FRI folding arity (`log_2`). 1 = binary folding. |
-| `--hash` | `poseidon2` | Hash function used internally by the prover: `poseidon2` / `sha256` / `blake3` |
-
-The header line prints the resulting **conjectured soundness bits** according to
-the ethSTARK heuristic: `log_blowup × num_queries + query_pow_bits`. The
-defaults give ~116 bits. It also prints `prefill=N` so runs against an empty
-tree and runs against an existing tree are easy to distinguish.
+`perf` flags: `--batches`, `--prefill`, `--seed`, `--log-blowup` (FRI LDE
+rate), `--num-queries`, `--query-pow-bits` (grinding), `--max-log-arity`
+(FRI folding), `--hash` (`poseidon2` / `sha256` / `blake3` / `all`). The
+header prints conjectured soundness bits per the ethSTARK heuristic
+`log_blowup × num_queries + query_pow_bits`.
 
 Output columns:
 
 ```
-batch  L_ops  N_ops  B_perms  cells  wit_ms  trace_ms  prove_ms  verify_ms  proof_KB
+batch  L  N  B_perms  cells  maxW  wit_ms  prove_ms  verify_ms  proof_KB
 ```
 
-Per-table breakdown follows: real rows / padded height / main width +
-preprocessed width / total cells.
+Other subcommands: `smt` (pure-CPU verify, no STARK) and `round` (a single
+measured round with the full per-table real/padded/main/prep/cells
+breakdown, timings, and proof size).
 
-### Other subcommands
+### Proving-hash selection
 
-- `smt --prefill N --batch B` -- pure CPU consistency-proof verify (no STARK).
-- `poseidon2 --num-hashes K` -- standalone Poseidon2 FRI proof.
-- `table-a --batch B`, `table-f --batch B` -- single-AIR FRI prove/verify.
-- `batch --batch B` -- full six-AIR `prove_batch` (no metrics).
-
----
-
-## Example results
-
-Hardware: Apple M1 "pro", release build, `parallel` feature on.
-All runs at ~116-bit conjectured soundness, using poseidon2 internally
-
-### Default config (`log_blowup=1, num_queries=100, pow=16`)
-
-| batch | L_ops | N_ops | B_perms | cells | wit_ms | trace_ms | prove_ms | verify_ms | proof_KB |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4096 | 4096 | 4095 | 16383 |  6.4M | 20 | 4 | 143 | 45 | 1759.6 |
-| 8192 | 8192 | 8191 | 32767 | 12.8M | 37 | 5 | 228 | 47 | 1816.9 |
-
-### Reduced proof size (`log_blowup=2, num_queries=50, pow=16`)
-
-| batch | wit_ms | trace_ms | prove_ms | verify_ms | proof_KB |
-|---:|---:|---:|---:|---:|---:|
-| 4096 | 19 | 2 | 198 | 24 |  928.5 |
-| 8192 | 38 | 7 | 378 | 25 |  959.3 |
-
-Effect: zk proof size shrinks to half, prove time roughly doubles, verify time
-**halves** (fewer queries to open). Soundness unchanged.
-
-### More PoW (`log_blowup=1, num_queries=92, pow=24`)
-
-| batch | wit_ms | trace_ms | prove_ms | verify_ms | proof_KB |
-|---:|---:|---:|---:|---:|---:|
-| 4096 | 20 | 3 | 985 | 42 | 1623.5 |
-| 8192 | 39 | 5 | 809 | 43 | 1676.2 |
-
-Effect: 8% smaller proof but **5–7x slower prove** -- the grinding
-dominates. Verify and soundness essentially unchanged. Does
-not look like a useful compromise.
-
-> Soundness vs zero-knowledge: these configurations are not zk in the sense
-  of guaranteeing the privacy of private inputs; for zk,
-  use `FriParameters::new_benchmark_zk` and add masking columns. Which is out of
-  scope -- the goal is data+work reduction for the verifier, not
-  zero-knowledge.
-
-## Proving Hash Selection
-
-The proof system uses hashing internally:
-
-- Merkle commitments for main, permutation, quotient, preprocessed, and FRI
-  folded-codeword matrices.
-- The FRI commit-phase MMCS through `FriParameters::mmcs`.
-- The Fiat-Shamir challenger and proof-of-work grinding.
-
-See cli flags above how to test, and `rsmt-air.md` how to choose programmatically.
-
-Use `poseidon2` when this proof is intended to be recursively verified inside a
-field-friendly circuit. Use `sha256` or `blake3` for a final native-CPU proof
-when zk recursion is not needed.
-
-Measured with default FRI config
-(`log_blowup=1`, `num_queries=100`, `query_pow_bits=16`,
-`max_log_arity=3`, about 116 conjectured soundness bits):
-
-| proof hash | batch | prove_ms | verify_ms | proof_KB |
-|---|---:|---:|---:|---:|
-| poseidon2 | 4096 | 138 | 41 | 1759.6 |
-| sha256 | 4096 | 149 | 18 | 1691.1 |
-| blake3 | 4096 | 130 | 12 | 1691.1 |
-
-
-## Security Argument
-
-This is an informal soundness argument. The threat model is the same
-dishonest-operator setting as `ndrsmt3o.py`: a malicious prover holds the
-trace and tries to produce a verifying proof for a false statement
-`(old_root, new_root)`.
-
-### Assumptions
-
-1. **Cryptographic.** Poseidon2 over BabyBear (width 16) is collision- and
-   second-preimage-resistant when used in the two domain-separated modes
-   defined in section 1 of `rsmt-air.md` (`DOMAIN_LEAF`, `DOMAIN_NODE`).
-2. **STARK soundness.** `p3-uni-stark` quotient evaluation, the
-   `TwoAdicFriPcs` low-degree test, and the Fiat–Shamir challenger compose
-   to a sound argument of knowledge; concrete soundness is the
-   conjectured ~116 bits at the default config (see `ProverConfig`).
-3. **LogUp soundness.** With per-bus challenges `(α, β) ∈ EF =
-   BabyBear^4` (`|EF| ≈ 2^124`) sampled after the main commitment, the
-   multiset-equality check has soundness error
-   `≤ Σ_AIRs padded_height / |EF|`, which is below `2^-100` for every bus
-   in the parameter range used here (≤ 2^17 cells per AIR).
-4. **Public statement.** The verifier knows `(old_root, new_root)` and
-   the per-AIR shape `(padded_height, real_rows)` for `A, B, C, F` plus
-   `padded_height` for `D`. These shapes deterministically fix the
-   preprocessed columns `is_real`, `is_last_real`, `row_idx` (Table A),
-   `is_real_f` (F), `leaf_idx`/`is_step_*`/`is_real_c` (C), `byte` (E),
-   and the layout of the Vectorized Poseidon2 lane mask (B). Table D's
-   preprocessed embeds the *private* batch and is committed by the
-   prover; the verifier consumes only its commitment, transcript-bound to
-   the rest of the proof.
-5. **Out-of-scope batch hygiene.** The AIR does *not* enforce in-circuit
-   that the batch is sorted, that its keys are pairwise distinct, or that
-   each key is genuinely absent from the pre-state tree. These are
-   protocol-level preconditions on the input given to the prover; see
-   "Limitations" below.
-6. **Node hashing** It is assumed that for internal nodes, the input child
-   hashes are valid hash outputs.
-
-### What the proof binds, end-to-end
-
-The verifier accepts iff the prover commits traces that satisfy every
-local constraint (per-AIR `eval`) and every LogUp multiset balance over
-six global buses. We chase the chain from public roots back to the
-private batch.
-
-1. **Boundary -> root pair.** Table A's last real row pins
-   `(old_hash, new_hash) = (public_old_root, public_new_root)` via
-   `is_last_real * (old_hash[j] - public_old_root[j]) = 0` and the
-   analogous new-root constraint (`table_a.rs:172-181`). The last real
-   row is the *only* row that does not send Bus 1 (multiplicity is
-   `is_real * (1 - is_last_real)`); every other real A row is consumed
-   as a child.
-
-2. **Tree shape (Bus 1 + locality).** Every non-last real A row sends
-   `(row_idx, old_hash, new_hash, old_is_none)` once; every real F row
-   receives the same tuple twice (left and right children at multiplicity
-   `is_real_f`). LogUp soundness forces the multiset of received `row_idx`
-   values to equal the multiset of sent `row_idx` values. Because the
-   sender side has *unique* `row_idx` (preprocessed = row index), each
-   non-last A row is consumed by exactly one F row position. Combined
-   with `right_ptr = parent_row_idx - 1` (`table_f.rs:122`), this is the
-   post-order tree shape: each F row is the unique parent of two
-   consecutive subtrees, with the rightmost being immediate predecessor.
-   Padding rows in F are syntactically zero (`(1 - is_real_f) * col =
-   0`), so they cannot contribute spurious receives.
-
-3. **Internal-node hashing (Bus 2 + tail-zeroing).** Every real F row
-   sends a Bus-2 receive of
-   `(left_new[0..8] + DOMAIN_NODE/depth injection || right_new[0..8] ||
-   parent_new[0..8] || parent_new_tail[0..8])` at multiplicity `is_real_f`
-   -- i.e., the full 32-element Poseidon2 input‖output. Table B is the
-   only sender on Bus 2; its inner constraints (the upstream
-   `VectorizedPoseidon2Air`) certify each lane is a genuine Poseidon2
-   evaluation, and its lane-mask preprocessed gates the Bus-2 send to
-   real lanes only. So `parent_new = H_node(left_new, right_new, depth)`
-   bit-for-bit. When `b11 = 1`, F additionally receives the analogous
-   old-hash tuple at multiplicity `is_real_f * b11`, forcing
-   `parent_old = H_node(left_old, right_old, depth)`. The
-   `parent_*_tail` columns are necessary because a digest is only the
-   first 8 of 16 output limbs; without committing the tail, the bus
-   tuple would only constrain the truncated output, leaving the prover
-   free to forge non-Poseidon2 16-element strings whose first 8 limbs
-   match. The constraint `(1 - b11) * parent_old_tail[j] = 0`
-   (`table_f.rs:148`) prevents pass-through rows from smuggling tail
-   values that are not bound to any Bus-2 receive.
-
-4. **Old-state four-way rule (local).** F enforces, componentwise:
-   `(1 - b11) * parent_old[j] = b01 * right_old[j] + b10 * left_old[j]`
-   together with `parent_none = left_none * right_none`,
-   `parent_none * parent_old[j] = 0`, and the booleanity / product
-   identities for `b01`, `b10`, `b11` (`table_f.rs:124-143`). Case
-   enumeration:
-     - `(left_none, right_none) = (1,1)`: `b01=b10=b11=0`,
-       `parent_none=1` → `parent_old = 0` (matches `Op::N` rule for
-       `(None, None) → None`, encoded as canonical zero).
-     - `(1,0)`: `b01=1` → `parent_old = right_old` (passthrough).
-     - `(0,1)`: `b10=1` → `parent_old = left_old` (passthrough).
-     - `(0,0)`: `b11=1` → constraint vacuous; Bus 2 forces
-       `parent_old = H_node(left_old, right_old, depth)`.
-
-   This is exactly the `match` in `verify_consistency` (`crates/rsmt-core/src/proof.rs:70-75`).
-
-5. **Parent → A back-link (Bus 3).** F sends
-   `(parent_row_idx, parent_old, parent_new, parent_none, depth, b11)` at
-   `is_real_f`; A's `N` rows receive the same shape with
-   `(row_idx, old_hash, new_hash, old_is_none, depth,
-   node_hash_old_needed)` at `is_real * is_n`. Bijectively: each F row
-   matches exactly one A `N` row at the same `row_idx`. So an A `N`
-   row's `old_hash` and `new_hash` are tied to F's `parent_old` /
-   `parent_new`, which we've just shown are correct. `depth` is bound
-   identically across A and F.
-
-6. **Depth range (Bus 5).** A's N rows receive `(depth)` from Table E,
-   whose preprocessed sender column is exactly `byte ∈ {0..255}`. LogUp
-   balance forces every received `depth` to equal some `byte`, so
-   `depth ∈ [0, 256)`. Table E's `mult` is unconstrained locally; the
-   only way it can balance is to count A's N-row depths exactly.
-
-7. **Leaf hashing (Bus 4 + Bus 2 + sponge transitions).** A's L rows
-   receive `(batch_idx, new_hash[0..8])` from C's step-2 rows. C's
-   per-row Bus-2 receive of `(state_in[0..16], state_out[0..16])` ties
-   each row to a real Poseidon2 evaluation. The local constraints on C
-   (`table_c.rs:111-156`) force:
-     - step-0 init: `state_in[0] = DOMAIN_LEAF`, `state_in[1..8] =
-       key[0..7]`, `state_in[8..16] = 0`;
-     - step-1 / step-2 transitions: `next.state_in =
-       local.state_out + injection[step]`, with the injection patterns
-       specified in section 1 of `rsmt-air.md`;
-     - key/value continuity within one leaf
-       (`cont * (next.key - local.key) = 0`).
-   So C's last-step `state_out[0..8]` is, by construction, the spec'd
-   leaf digest of `(key, value)`, which is sent to A on Bus 4.
-
-8. **Batch binding (Bus 6).** D sends `(idx, key[0..9], value[0..9])` at
-   `is_real_d` from preprocessed; C receives the same tuple on step-2
-   rows at `is_step_2`. The preprocessed `leaf_idx = i / 3` for
-   `i ∈ [0, 3B)` covers `{0..B-1}` exactly once on step-2 rows, so the
-   Bus-6 receivers form a multiset of `B` distinct keys. LogUp balance
-   forces D's senders to be the same multiset → C-leaf-i carries the
-   `(key, value)` of D-row-i. Composing with step 7: A's L row with
-   `batch_idx = i` carries the digest of D-row-i's `(key, value)`.
-
-9. **Composition.** Putting steps 1–8 together:
-   `(old_root, new_root) = boundary value of A’s last real row`,
-   computed by walking from A's leaf and S rows up through F's joins
-   (each constrained to the correct hashing rule), with leaves bound to
-   the prover-supplied private batch through D => C => A. The post-order
-   shape is enforced by Bus 1 + locality. By Poseidon2 collision
-   resistance, the only multiset of inputs that produces the public
-   `new_root` is the spec'd one: a tree of node hashes over leaf hashes
-   of the batch keys/values, plus the unchanged `S(h)` subtrees declared
-   on the periphery. Any deviation -- a wrong S digest, a wrong join, a
-   wrong leaf hash, or a bogus batch entry -- propagates upward and breaks
-   the boundary equality on `new_root` (or `old_root` for pre-state
-   tampering, since the same chain reconstructs both).
-
-### Soundness mapping for the informal claims
-
-| Claim | Enforced by |
-|---|---|
-| Integrity (pre-state) | Boundary on `old_hash` (step 1) + same chain as new_root (steps 2–4 with old_* columns) -- collision resistance of Poseidon2 propagates any pre-state edit to the root. |
-| Complete coverage | Bus 1 multiset balance + unique `row_idx` on the sender side + locality `right_ptr = parent_row_idx − 1` (step 2). |
-| Right/left order binding | Different positions in `node_hash_input` (left -> state[0..8] + DOMAIN_NODE/depth, right -> state[8..16]) + `right_ptr = parent_row_idx − 1` (step 2 + step 3). |
-| Depth binding | `depth` is added into `state[1]` of `node_hash_input` (step 3); range-checked by Bus 5 (step 6); tied between A and F by Bus 3 (step 5). |
-| Batch completeness | Bus 4 + Bus 6 chain plus the preprocessed `leaf_idx` covering `{0..B-1}` exactly once on step-2 rows (steps 7–8). |
-| No phantom data | The only producer of an L row's `new_hash` is C-step-2's digest (Bus 4), and C is bound to D (Bus 6). No opcode lets A's witness invent a key-value pair (steps 7–8). |
-| Correct old-state passthrough | The local four-way rule in F (step 4) is a case-by-case translation of the reference `verify_consistency` match arm. |
-| Fresh-leaf | *Out of scope* -- see "Limitations" below. |
-
-### Adversarial test coverage
-
-The implementation includes nine targeted tamper tests
-(`crates/rsmt-prover/src/tamper.rs`) that perturb a verifying trace
-post-build and assert that proving or verification fails:
-
-- swap left/right children, duplicate an A row, depth bump on F,
-  forge `old_is_none`, break the four-way passthrough, reuse a
-  permutation result across leaves, tamper a Poseidon2 output tail,
-  scramble an A digest, and break Table E's multiplicity column.
-
-These exercise Buses 1, 2, 3, 4, 5 and the local constraints on A and F
-(see test names `*_rejected` in `tamper.rs`).
-
-### Limitations and out-of-scope guarantees
-
-The argument above proves: *there exists a batch B and a consistency
-proof π such that inserting B into the tree with root `old_root`
-produces `new_root`*, without deleting or modifying existing leaves.
-The AIR deliberately stops there. Several properties are instead
-self-policed by the surrounding aggregator protocol:
-
-- **Canonical tree shape is not enforced in-circuit.** The AIR accepts
-  any post-order opcode stream that hashes consistently into
-  `(old_root, new_root)` -- including streams that describe a
-  non-canonical, non-path-compressed tree built by ignoring RSMT3's
-  bifurcation rules. This is intentional. The aggregator commits
-  `(old_root, new_root)` publicly and is expected to later serve
-  *inclusion proofs* for individual leaves against those committed
-  roots. Inclusion proofs follow the canonical RSMT3 building rules;
-  any deviation made by the prover at insert time prevents them from
-  producing valid inclusion proofs later for keys that supposedly
-  belong to the tree. A dishonest tree-builder therefore only damages
-  their own service availability -- they cannot trick inclusion-proof
-  verifiers into accepting bogus membership claims, because canonical
-  inclusion checks would fail against the non-canonical root.
-- **Acyclic reachability from the last A row is not directly enforced.**
-  Bus 1 closure plus uniqueness of `row_idx` make every non-last A row a
-  child of exactly one F row -- the structure is a *functional graph*
-  with a single sink (the last real A row), but the AIR does not impose
-  `left_ptr < parent_row_idx`. In principle this leaves room for a
-  disjoint cycle of rows whose digests close under Bus 1 yet are not
-  reachable from the sink. Such a cycle would force a Poseidon2
-  fixed-point or short-cycle preimage (e.g. `parent_new =
-  H_node(parent_new, right_new, depth)` for a self-loop), which is
-  intractable under Assumption 1, so the soundness chase in steps 1--9
-  is unaffected. The same protocol-level self-policing argument as the
-  canonical-shape bullet covers any residual non-tree shape that does
-  reach the root. A cheap in-circuit hardening, if desired, is a single
-  witness column for `parent_row_idx − left_ptr − 1` range-checked via
-  Bus 5 (or a dedicated receive on Table E); this would make the
-  acyclic-reachability property structural rather than
-  cryptographic-plus-protocol.
-- **Batch identity is not bound to the proof.** The verifier never sees
-  `B`. This is fine for the same reason: each individual leaf's presence
-  in `new_root` is independently provable via an inclusion proof against
-  the public root. The aggregator does not need the AIR to certify "the
-  batch was exactly the set of user-signed transactions"; downstream
-  consumers query inclusion of specific keys, and the public root is
-  the binding commitment.
-- **Sortedness and key-distinctness of the batch.** Table D does not
-  verify that `key[i] < key[i+1]` in sort-key order or that keys are
-  pairwise distinct. The prover sorts and de-duplicates externally.
-  Same self-policing argument: a prover who feeds in duplicates or an
-  unsorted batch produces some `new_root`, but cannot generate
-  inclusion proofs that contradict it.
-
-Remaining caveats:
-
-1. **Fresh-leaf scope (completeness, not soundness).** The opcode set has
-   no "leaf already existed" branch. If the prover supplies a key that
-   is already in the pre-state, no opcode stream can express the
-   insertion; the prover simply cannot produce a verifying witness. The
-   AIR is sound on such inputs but *incomplete* -- protocols must filter
-   pre-existing keys upstream before submitting them to the prover.
-2. **Empty pre-state.** When `old_root` is the canonical-zero "none"
-   digest, the boundary still pins `old_hash = 0` on the last real row
-   (no special case in the AIR). A standalone `S(None)` opcode is
-   rejected inside Table A's witness builder (`table_a.rs:71-78`); the
-   single-row empty-batch case is handled at the reference verifier
-   level (`proof.rs:36-43`) and is not in this AIR's scope.
-3. **Zero-knowledge.** The default FRI configuration is *not* zk in the
-   strict sense; private inputs (the batch and the proof opcodes) live
-   only in committed traces but the trace commitments are not masked.
-   For zk, switch to `FriParameters::new_benchmark_zk` and add masking
-   columns (out of scope here -- the goal is verifier work reduction, not
-   privacy of inputs against a curious verifier).
-
-### Summary
-
-Under Assumptions 1–4 above, a verifying proof implies the existence of
-some private batch and consistency-proof opcode stream that correctly
-transition the SMT root from `old_root` to `new_root`. The aggregator
-protocol around this AIR self-polices canonical tree construction and
-batch identity through the public root commitment plus on-demand
-inclusion proofs; the AIR deliberately does not duplicate those
-checks.
+The FRI/Merkle/Fiat–Shamir layer hashes internally, independent of the
+in-circuit tree hash (always Poseidon2). Use `poseidon2` when the proof
+will be recursively verified in a field-friendly circuit (e.g. the SP1
+aggregation of the paper); use `sha256`/`blake3` for a fast final native
+verify. On the structural predecessor, Blake3 FRI gave ~3× faster verify
+at equal prove time -- the same trade is expected here.

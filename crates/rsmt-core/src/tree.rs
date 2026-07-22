@@ -1,28 +1,27 @@
-//! Radix Sparse Merkle Tree v3 — Rust port of `ndrsmt3o.py`.
+//! Radix Sparse Merkle Tree (v6a) — Rust port of `rsmt6a.py`.
 //!
-//! Path convention (matches Python):
-//! `path = (1 << len) | prefix`. A child node's start_bit equals its parent's
-//! bifurcation depth, so the bit at the bifurcation depth is the *first* bit
-//! of the child's prefix (constant within the subtree).
+//! Nodes store **absolute** `(depth, region)` (D3): splitting an edge above a
+//! node changes neither, so inserting keys never re-hashes an existing node.
+//! `batch_insert` mirrors `_insert / _split_edge / _build / _emit_preserved`
+//! and emits the compact v6a opcode stream.
 
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
-use num_bigint::BigUint;
-
 use crate::hasher::Hasher;
+use crate::limbs::{Key, KeyValue, Value32, first_divergence, key_bit, region_limbs};
 use crate::proof::Op;
-use crate::sort_key::get_sort_key;
 
+/// A tree node. Junctions carry their absolute depth and left-aligned region.
 pub enum Node<H: Hasher> {
     Leaf {
-        key: BigUint,
-        value: Vec<u8>,
+        key: Key,
+        value: Value32,
         hash: H::Digest,
     },
-    Internal {
-        path: BigUint,
-        depth: u8,
+    Junction {
+        depth: u16,
+        region: Key,
         left: Box<Node<H>>,
         right: Box<Node<H>>,
         hash: H::Digest,
@@ -32,25 +31,33 @@ pub enum Node<H: Hasher> {
 impl<H: Hasher> Node<H> {
     pub fn hash(&self) -> &H::Digest {
         match self {
-            Node::Leaf { hash, .. } | Node::Internal { hash, .. } => hash,
+            Node::Leaf { hash, .. } | Node::Junction { hash, .. } => hash,
         }
     }
 
-    fn new_leaf(key: BigUint, value: Vec<u8>) -> Self {
+    fn new_leaf(key: Key, value: Value32) -> Box<Self> {
         let hash = H::hash_leaf(&key, &value);
-        Node::Leaf { key, value, hash }
+        Box::new(Node::Leaf { key, value, hash })
     }
 
-    fn new_internal(path: BigUint, depth: u8, left: Box<Node<H>>, right: Box<Node<H>>) -> Self {
-        let hash = H::hash_node(left.hash(), right.hash(), depth);
-        Node::Internal {
-            path,
+    fn new_junction(depth: u16, region: Key, left: Box<Node<H>>, right: Box<Node<H>>) -> Box<Self> {
+        let hash = H::hash_node(depth, &region, left.hash(), right.hash());
+        Box::new(Node::Junction {
             depth,
+            region,
             left,
             right,
             hash,
-        }
+        })
     }
+}
+
+/// A pre-existing leaf being merged into a freshly built subtree (leaf-merge
+/// case). Emitted as `OL` when the build reaches it.
+struct FrozenLeaf<D> {
+    key: Key,
+    value: Value32,
+    hash: D,
 }
 
 pub struct Tree<H: Hasher> {
@@ -76,248 +83,226 @@ impl<H: Hasher> Tree<H> {
         self.root.as_ref().map(|n| n.hash().clone())
     }
 
-    pub fn find_leaf(&self, key: &BigUint) -> Option<&Node<H>> {
+    /// Descend to the leaf for `key`, if present.
+    pub fn find_leaf(&self, key: &Key) -> Option<&Node<H>> {
         let mut node = self.root.as_deref()?;
-        let mut bit: u64 = 0;
         loop {
             match node {
                 Node::Leaf { key: k, .. } => return if k == key { Some(node) } else { None },
-                Node::Internal {
-                    path, left, right, ..
+                Node::Junction {
+                    depth,
+                    region,
+                    left,
+                    right,
+                    ..
                 } => {
-                    let n = path_len(path);
-                    let prefix = low_bits(path, n);
-                    if low_bits(&(key >> bit), n) != prefix {
+                    if region_limbs(key, *depth) != *region {
                         return None;
                     }
-                    bit += n;
-                    node = if key.bit(bit) { right } else { left };
+                    node = if key_bit(key, *depth) == 1 {
+                        right
+                    } else {
+                        left
+                    };
                 }
             }
         }
     }
 
-    pub fn batch_insert(
-        &mut self,
-        batch: Vec<(BigUint, Vec<u8>)>,
-    ) -> (Vec<(BigUint, Vec<u8>)>, Vec<Op<H::Digest>>) {
-        let mut new_items: BTreeMap<[u8; 32], (BigUint, Vec<u8>)> = BTreeMap::new();
+    /// Insert new `(key, value)` pairs. Keys already present, or duplicated
+    /// within `batch`, are skipped (honest dedup — an adversarial re-record is
+    /// *rejected by the verifier*, not here). Returns `(applied, proof)`.
+    ///
+    /// An empty applied set returns `(vec![], vec![])`: the empty-batch
+    /// identity transition is the caller's responsibility (D6).
+    pub fn batch_insert(&mut self, batch: Vec<KeyValue>) -> (Vec<KeyValue>, Vec<Op<H::Digest>>) {
+        // Keep the first occurrence of each new, not-yet-present key; BTreeMap
+        // keys sort MSB-first (== integer order).
+        let mut new_items: BTreeMap<Key, Value32> = BTreeMap::new();
         for (key, value) in batch {
-            let sk = get_sort_key(&key);
-            if new_items.contains_key(&sk) || self.find_leaf(&key).is_some() {
+            if new_items.contains_key(&key) || self.find_leaf(&key).is_some() {
                 continue;
             }
-            new_items.insert(sk, (key, value));
+            new_items.insert(key, value);
         }
-
         if new_items.is_empty() {
-            return (Vec::new(), vec![Op::S(self.root_hash())]);
+            return (Vec::new(), Vec::new());
         }
 
-        let items: Vec<(BigUint, Vec<u8>)> = new_items.into_values().collect();
+        let items: Vec<(Key, Value32)> = new_items.into_iter().collect();
         let mut proof = Vec::new();
-        let len = items.len();
         let root = std::mem::take(&mut self.root);
-        let new_root = insert_proof::<H>(root, &items, 0, len, 0, &mut proof);
+        let new_root = insert::<H>(root, &items, 0, items.len(), false, &mut proof);
         self.root = Some(new_root);
         (items, proof)
     }
 }
 
-fn path_len(p: &BigUint) -> u64 {
-    p.bits() - 1
-}
-
-fn low_bits(b: &BigUint, n: u64) -> BigUint {
-    if n == 0 {
-        return BigUint::ZERO;
-    }
-    let mask = (BigUint::from(1u8) << n) - BigUint::from(1u8);
-    b & &mask
-}
-
-fn lowest_set_bit(b: &BigUint) -> u64 {
-    b.trailing_zeros().expect("zero has no set bits")
-}
-
-fn build_subtree<H: Hasher>(
-    batch: &[(BigUint, Vec<u8>)],
-    start: usize,
-    end: usize,
-    start_bit: u64,
-    proof: &mut Vec<Op<H::Digest>>,
-    frozen: &Option<(BigUint, H::Digest)>,
-) -> Box<Node<H>> {
-    if end - start == 1 {
-        let (k, v) = &batch[start];
-        if let Some((fk, fh)) = frozen {
-            if fk == k {
-                proof.push(Op::S(Some(fh.clone())));
-                return Box::new(Node::new_leaf(k.clone(), v.clone()));
-            }
-        }
-        proof.push(Op::L);
-        return Box::new(Node::new_leaf(k.clone(), v.clone()));
-    }
-
-    let xor = (&batch[start].0 ^ &batch[end - 1].0) >> start_bit;
-    let split = start_bit + lowest_set_bit(&xor);
-
-    let mut low = start;
-    let mut high = end;
+/// First index in `items[lo..hi]` whose key has bit `depth` set (partition
+/// point). The slice is sorted, so all set-bit keys form the suffix.
+fn partition<D>(items: &[(Key, D)], lo: usize, hi: usize, depth: u16) -> usize {
+    let (mut low, mut high) = (lo, hi);
     while low < high {
         let mid = (low + high) / 2;
-        if batch[mid].0.bit(split) {
+        if key_bit(&items[mid].0, depth) == 1 {
             high = mid;
         } else {
             low = mid + 1;
         }
     }
-    let mid = low;
-
-    let n_common = split - start_bit;
-    let prefix_low = low_bits(&(&batch[start].0 >> start_bit), n_common);
-    let cp = (BigUint::from(1u8) << n_common) | prefix_low;
-
-    let left = build_subtree::<H>(batch, start, mid, split, proof, frozen);
-    let right = build_subtree::<H>(batch, mid, end, split, proof, frozen);
-    proof.push(Op::N(split as u8));
-    Box::new(Node::new_internal(cp, split as u8, left, right))
+    low
 }
 
-fn insert_proof<H: Hasher>(
-    node: Option<Box<Node<H>>>,
-    batch: &[(BigUint, Vec<u8>)],
-    start: usize,
-    end: usize,
-    start_bit: u64,
-    proof: &mut Vec<Op<H::Digest>>,
-) -> Box<Node<H>> {
-    if start == end {
-        let n = node.expect("empty subtree without batch");
-        proof.push(Op::S(Some(n.hash().clone())));
-        return n;
+/// A subtree untouched this round: opaque `S` under an old junction, opened
+/// one level (`O` / `OL`) under a new junction (the split edge).
+fn emit_preserved<H: Hasher>(node: &Node<H>, parent_new: bool, out: &mut Vec<Op<H::Digest>>) {
+    if !parent_new {
+        out.push(Op::S(node.hash().clone()));
+        return;
     }
-
-    let Some(n) = node else {
-        return build_subtree::<H>(batch, start, end, start_bit, proof, &None);
-    };
-
-    match *n {
-        Node::Leaf { key, value, hash } => {
-            let frozen = Some((key.clone(), hash.clone()));
-            let mut mixed: Vec<(BigUint, Vec<u8>)> = batch[start..end].to_vec();
-            mixed.push((key, value));
-            mixed.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
-            let len = mixed.len();
-            build_subtree::<H>(&mixed, 0, len, start_bit, proof, &frozen)
-        }
-        Node::Internal {
-            path,
+    match node {
+        Node::Leaf { key, value, .. } => out.push(Op::OL {
+            key: *key,
+            value: *value,
+        }),
+        Node::Junction {
             depth,
+            region,
             left,
             right,
-            hash: _,
+            ..
+        } => out.push(Op::O {
+            depth: *depth,
+            region: *region,
+            c_l: left.hash().clone(),
+            c_r: right.hash().clone(),
+        }),
+    }
+}
+
+/// Build a fresh subtree over sorted `items[lo..hi]`; every junction is new.
+/// `frozen`, if present, is a pre-existing leaf being merged (emitted `OL`).
+fn build<H: Hasher>(
+    items: &[(Key, Value32)],
+    lo: usize,
+    hi: usize,
+    frozen: Option<&FrozenLeaf<H::Digest>>,
+    out: &mut Vec<Op<H::Digest>>,
+) -> Box<Node<H>> {
+    if hi - lo == 1 {
+        let (k, v) = &items[lo];
+        if let Some(f) = frozen
+            && f.key == *k
+        {
+            out.push(Op::OL {
+                key: f.key,
+                value: f.value,
+            });
+            return Box::new(Node::Leaf {
+                key: f.key,
+                value: f.value,
+                hash: f.hash.clone(),
+            });
+        }
+        out.push(Op::L);
+        return Node::new_leaf(*k, *v);
+    }
+
+    let split = first_divergence(&items[lo].0, &items[hi - 1].0);
+    let region = region_limbs(&items[lo].0, split);
+    let mid = partition(items, lo, hi, split);
+    let ln = build::<H>(items, lo, mid, frozen, out);
+    let rn = build::<H>(items, mid, hi, frozen, out);
+    out.push(Op::N { depth: split });
+    Node::new_junction(split, region, ln, rn)
+}
+
+fn insert<H: Hasher>(
+    node: Option<Box<Node<H>>>,
+    items: &[(Key, Value32)],
+    lo: usize,
+    hi: usize,
+    parent_new: bool,
+    out: &mut Vec<Op<H::Digest>>,
+) -> Box<Node<H>> {
+    if lo == hi {
+        let node = node.expect("empty subtree without batch items");
+        emit_preserved::<H>(&node, parent_new, out);
+        return node;
+    }
+
+    let Some(node) = node else {
+        return build::<H>(items, lo, hi, None, out);
+    };
+
+    match *node {
+        Node::Leaf { key, value, hash } => {
+            // Keys are pre-filtered distinct from `key`: merge and rebuild.
+            let frozen = FrozenLeaf { key, value, hash };
+            let mut merged: Vec<(Key, Value32)> = items[lo..hi].to_vec();
+            merged.push((key, value));
+            merged.sort_by_key(|a| a.0);
+            let len = merged.len();
+            build::<H>(&merged, 0, len, Some(&frozen), out)
+        }
+        Node::Junction {
+            depth,
+            region,
+            left,
+            right,
+            hash,
         } => {
-            let n_path = path_len(&path);
-            let node_prefix = low_bits(&path, n_path);
-
-            let xor_start = low_bits(&(&batch[start].0 >> start_bit), n_path) ^ &node_prefix;
-            let xor_end = low_bits(&(&batch[end - 1].0 >> start_bit), n_path) ^ &node_prefix;
-            let mut first_div = n_path;
-            if xor_start != BigUint::ZERO {
-                first_div = first_div.min(lowest_set_bit(&xor_start));
+            // Does either batch extreme diverge from this junction's region
+            // above its depth?
+            let mut d_div = depth;
+            for probe in [&items[lo].0, &items[hi - 1].0] {
+                let fd = first_divergence(probe, &region).min(depth);
+                d_div = d_div.min(fd);
             }
-            if xor_end != BigUint::ZERO {
-                first_div = first_div.min(lowest_set_bit(&xor_end));
+            if d_div < depth {
+                let preserved = Box::new(Node::Junction {
+                    depth,
+                    region,
+                    left,
+                    right,
+                    hash,
+                });
+                return split_edge::<H>(preserved, region, items, lo, hi, d_div, out);
             }
 
-            if first_div < n_path {
-                return node_split_proof::<H>(
-                    path, depth, left, right, batch, start, end, start_bit, first_div, proof,
-                );
-            }
-
-            let split = start_bit + n_path;
-            let mut low = start;
-            let mut high = end;
-            while low < high {
-                let mid = (low + high) / 2;
-                if batch[mid].0.bit(split) {
-                    high = mid;
-                } else {
-                    low = mid + 1;
-                }
-            }
-            let mid = low;
-
-            let new_left = insert_proof::<H>(Some(left), batch, start, mid, split, proof);
-            let new_right = insert_proof::<H>(Some(right), batch, mid, end, split, proof);
-            proof.push(Op::N(depth));
-            Box::new(Node::new_internal(path, depth, new_left, new_right))
+            let mid = partition(items, lo, hi, depth);
+            let new_left = insert::<H>(Some(left), items, lo, mid, false, out);
+            let new_right = insert::<H>(Some(right), items, mid, hi, false, out);
+            out.push(Op::N { depth });
+            Node::new_junction(depth, region, new_left, new_right)
         }
     }
 }
 
+/// New junction at depth `d_div` above `node` (canonical edge split). The
+/// preserved node keeps its absolute depth/region/hash — it is never re-hashed.
 #[allow(clippy::too_many_arguments)]
-fn node_split_proof<H: Hasher>(
-    old_path: BigUint,
-    _old_depth: u8,
-    left: Box<Node<H>>,
-    right: Box<Node<H>>,
-    batch: &[(BigUint, Vec<u8>)],
-    start: usize,
-    end: usize,
-    start_bit: u64,
-    first_div: u64,
-    proof: &mut Vec<Op<H::Digest>>,
+fn split_edge<H: Hasher>(
+    node: Box<Node<H>>,
+    node_region: Key,
+    items: &[(Key, Value32)],
+    lo: usize,
+    hi: usize,
+    d_div: u16,
+    out: &mut Vec<Op<H::Digest>>,
 ) -> Box<Node<H>> {
-    let n_path = path_len(&old_path);
-    let node_prefix = low_bits(&old_path, n_path);
-
-    let n_common = first_div;
-    let new_cp = (BigUint::from(1u8) << n_common) | low_bits(&node_prefix, n_common);
-    let new_split = start_bit + n_common;
-
-    // Existing node, re-rooted: shift sentinel-encoded path right by n_common.
-    // First bit of new path is the bifurcation bit (constant within the subtree).
-    let shifted = &old_path >> n_common;
-    let new_old_path = if shifted == BigUint::ZERO {
-        BigUint::from(1u8)
-    } else {
-        shifted
-    };
-    let old_depth = (start_bit + n_path) as u8;
-    let shortened = Box::new(Node::new_internal(new_old_path, old_depth, left, right));
-
-    let old_dir_bit = (&node_prefix >> n_common).bit(0);
-
-    let mut low = start;
-    let mut high = end;
-    while low < high {
-        let mid = (low + high) / 2;
-        if batch[mid].0.bit(new_split) {
-            high = mid;
-        } else {
-            low = mid + 1;
-        }
-    }
-    let mid = low;
-
-    let (new_left, new_right) = if !old_dir_bit {
-        let l = insert_proof::<H>(Some(shortened), batch, start, mid, new_split, proof);
-        let r = insert_proof::<H>(None, batch, mid, end, new_split, proof);
+    let region = region_limbs(&node_region, d_div);
+    let node_side = key_bit(&node_region, d_div);
+    let mid = partition(items, lo, hi, d_div);
+    let (ln, rn) = if node_side == 0 {
+        let l = insert::<H>(Some(node), items, lo, mid, true, out);
+        let r = build::<H>(items, mid, hi, None, out);
         (l, r)
     } else {
-        let l = insert_proof::<H>(None, batch, start, mid, new_split, proof);
-        let r = insert_proof::<H>(Some(shortened), batch, mid, end, new_split, proof);
+        let l = build::<H>(items, lo, mid, None, out);
+        let r = insert::<H>(Some(node), items, mid, hi, true, out);
         (l, r)
     };
-    proof.push(Op::N(new_split as u8));
-    Box::new(Node::new_internal(
-        new_cp,
-        new_split as u8,
-        new_left,
-        new_right,
-    ))
+    out.push(Op::N { depth: d_div });
+    Node::new_junction(d_div, region, ln, rn)
 }
