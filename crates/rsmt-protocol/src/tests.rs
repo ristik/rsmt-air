@@ -148,6 +148,47 @@ fn shape_rejects_bus_multiplicity_wrap() {
     assert_eq!(s.validate(), Err(DecodeError::InvalidShape));
 }
 
+#[test]
+fn describe_rejection_none_when_valid() {
+    assert_eq!(good_shape().describe_rejection(), None);
+}
+
+#[test]
+fn describe_rejection_height_tells_soundness_story() {
+    // n_ops just over 2^MAX_LOG_HEIGHT forces Table A's padded height over the cap.
+    let n_ops = (1usize << MAX_LOG_HEIGHT) + 1;
+    let s = RoundShape {
+        n_ops,
+        n_leaf: 1,
+        n_join: 1,
+        n_open: 0,
+        n_b11: 0,
+        n_p2ff: 3,
+        n_p2term: 2,
+    };
+    let msg = s.describe_rejection().expect("rejected");
+    // Names the binding table, the derived padded height, and the frozen cap.
+    assert!(msg.contains("Table A"), "{msg}");
+    assert!(msg.contains("131072") && msg.contains("2^17"), "{msg}");
+    assert!(msg.contains("65536") && msg.contains("2^16"), "{msg}");
+    // Carries the soundness rationale, not just a bare limit.
+    assert!(msg.contains("soundness"), "{msg}");
+    assert!(msg.contains("LogUp"), "{msg}");
+    // The wire-level surface is still the opaque variant.
+    assert_eq!(s.validate(), Err(DecodeError::InvalidShape));
+}
+
+#[test]
+fn describe_rejection_reports_specific_identity() {
+    // A broken feed-forward count names the p2ff bus, not a generic failure.
+    let s = RoundShape {
+        n_p2ff: 4,
+        ..good_shape()
+    };
+    let msg = s.describe_rejection().expect("rejected");
+    assert!(msg.contains("p2ff"), "{msg}");
+}
+
 // -- transcript domain separation -------------------------------------------
 
 #[test]

@@ -96,9 +96,10 @@ where
     // (count identities, per-bus no-wrap, max height) before any expensive work.
     // The verifier reconstructs this shape from the public inputs and runs the
     // identical check.
-    round_shape(plan)
+    let shape = round_shape(plan);
+    shape
         .validate()
-        .map_err(|e| format!("invalid round shape: {e:?}"))?;
+        .map_err(|_| shape.describe_rejection().unwrap_or_default())?;
 
     // -- traces from the plan --
     let (mut a, a_real, a_height) = table_ar::build_trace(&plan.a_rows);
@@ -305,7 +306,7 @@ where
     SymbolicExpressionExt<F, EF>: Algebra<EF>,
     BatchProof<H::Config>: Sized,
 {
-    rsmt_protocol::RoundShape {
+    let protocol_shape = rsmt_protocol::RoundShape {
         n_ops: shape.n_ops,
         n_leaf: shape.n_leaf,
         n_join: shape.n_join,
@@ -313,9 +314,10 @@ where
         n_b11: shape.n_b11,
         n_p2ff: shape.n_p2ff,
         n_p2term: shape.n_p2term,
-    }
-    .validate()
-    .map_err(|e| format!("invalid round shape: {e:?}"))?;
+    };
+    protocol_shape
+        .validate()
+        .map_err(|_| protocol_shape.describe_rejection().unwrap_or_default())?;
 
     let config = H::build_config(seed, cfg);
     let mut airs = r3_airs_from_shape(shape);

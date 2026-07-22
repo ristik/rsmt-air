@@ -21,7 +21,7 @@ use rsmt_core::{Key, KeyValue, Tree, Value32, bytes_to_limbs, verify_consistency
 use rsmt_hash::Poseidon2Hasher;
 use rsmt_prover::config::ProverConfig;
 use rsmt_prover::proof_hash::{Blake3ProofHash, Poseidon2ProofHash, ProvingHash, Sha256ProofHash};
-use rsmt_prover::{prove_r3_round, r3_round_cells, verify_r3_round};
+use rsmt_prover::{prove_r3_round, r3_round_cells, round_shape, verify_r3_round};
 use rsmt_witness::r3build::{R3Plan, build_r3_plan};
 
 #[derive(Parser, Debug)]
@@ -160,6 +160,17 @@ fn build_round_plan(seed: u64, prefill: usize, batch: usize) -> (R3Plan, Duratio
     (plan, t.elapsed())
 }
 
+/// Run the same pre-allocation shape gate the prover/verifier enforce, returning
+/// the operator-facing rejection story if this round's shape is out of bounds
+/// (typically a batch whose Table A padded height exceeds the frozen `N_max`).
+/// Checking here skips a doomed multi-second prove and a cryptic verify panic.
+fn shape_gate(plan: &R3Plan) -> Result<(), String> {
+    match round_shape(plan).describe_rejection() {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
 /// Prove + verify one R3 round with the requested proving-hash suite, timing
 /// each phase and serializing the proof for its byte size.
 fn measure(plan: &R3Plan, seed: u64, cfg: &ProverConfig, hash: ProvingHash) -> R3Metrics {
@@ -238,6 +249,10 @@ fn run_round(batch: usize, prefill: usize, seed: u64, cfg: &ProverConfig, hash: 
         "round: prefill={prefill} batch={batch} (ops={} L={} N={} O={}) witness={wit:?}",
         plan.shape.n_ops, plan.shape.n_leaf, plan.shape.n_join, plan.shape.n_open,
     );
+    if let Err(reason) = shape_gate(&plan) {
+        eprintln!("\n{reason}\n");
+        return;
+    }
     for &h in hash.suites() {
         println!("proof_hash={}", h.name());
         let m = measure(&plan, seed, cfg, h);
@@ -276,6 +291,14 @@ fn run_perf(batches: &str, prefill: usize, seed: u64, cfg: &ProverConfig, hash: 
         for &b in &sizes {
             let (plan, wit) = build_round_plan(seed, prefill, b);
             let (n_l, n_join) = (plan.shape.n_leaf, plan.shape.n_join);
+            if let Err(reason) = shape_gate(&plan) {
+                println!(
+                    "{:>6} {:>7} {:>7} {:>9} {:>13} {:>6} {:>7} {:>9} {:>10} {:>9}",
+                    b, n_l, n_join, "-", "SKIP", "-", wit.as_millis(), "-", "-", "-",
+                );
+                eprintln!("\n{reason}\n");
+                continue;
+            }
             let m = measure(&plan, seed, cfg, h);
             println!(
                 "{:>6} {:>7} {:>7} {:>9} {:>13} {:>6} {:>7} {:>9} {:>10} {:>9.1}",
